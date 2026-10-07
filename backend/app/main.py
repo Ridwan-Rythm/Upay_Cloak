@@ -37,7 +37,7 @@ def create_app() -> FastAPI:
         description="Case-centric fraud detection, graph analytics and a grounded AI assistant for mobile money.",
         version="1.1.0", lifespan=lifespan)
     app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origins, allow_credentials=False,
-                       allow_methods=["*"], allow_headers=["*"])
+                       allow_methods=["GET", "POST", "OPTIONS"], allow_headers=["Content-Type", "Authorization", "X-Request-ID"])
 
     # every error uses the contract shape {"error": {"code", "message", "details"}}
     @app.exception_handler(StarletteHTTPException)

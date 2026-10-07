@@ -40,6 +40,7 @@ from backend.app.contracts.schemas_intel import FreezeImpact, GraphEdge, GraphNo
 PT_DWELL_S = 30 * 60          # forwarded within 30 minutes ...
 PT_LO, PT_HI = 0.7, 1.1       # ... at 70-110% of what came in
 PT_MIN_EVENTS = 2             # events needed before a wallet is a mule suspect
+RING_MIN_CONF = 0.5           # share of a suspect's pass-through events that must be "ring-consistent" (see _member_confidence)
 NEIGHBOUR_CAP = 25            # per node when drawing ego graphs (keeps hubs readable)
 MAX_TXN_IDS = 10
 
@@ -74,6 +75,7 @@ class NetworkXGraphService(GraphService):
         self._events: dict[str, list[tuple]] = defaultdict(list)  # wallet -> [(ts_out, dwell_seconds, out_txn)]
         self._device_users: dict[str, set[str]] = defaultdict(set)
         self._ring_assoc: set[str] = set()                 # ring wallets + their cash-out agents + shared devices
+        self._member_conf: dict[str, float] = {}           # ring member -> behavioural confidence (0..1)
 
     # ------------------------------------------------------------------ construction
     def _node(self, nid: str, kind: str) -> None:
@@ -164,6 +166,23 @@ class NetworkXGraphService(GraphService):
             self._wallet_since[sender] = self._events[sender][PT_MIN_EVENTS - 1][0]
             self._recompute_rings()
 
+    def _member_confidence(self) -> dict[str, float]:
+        """Per-wallet confidence = share of its pass-through events that are ring-consistent, i.e. the forwarded money
+        went to a cash-out agent or to another wallet that itself shows pass-through behaviour. Range 0..1."""
+        movers = {w for w, evs in self._events.items() if evs}
+        out: dict[str, float] = {}
+        for w in self._wallet_since:
+            evs = self._events.get(w, ())
+            if not evs:
+                continue
+            ok = 0
+            for _t, _d, out_txn in evs:
+                info = self._txn_lookup.get(out_txn)
+                if info and (info["type"] == "cash_out" or info["rcpt"] in movers):
+                    ok += 1
+            out[w] = ok / len(evs)
+        return out
+
     def _recompute_rings(self) -> None:
         for nid in list(self._wallet_to_ring) + list(self._ring_assoc):
             if nid in self.G:
@@ -172,13 +191,19 @@ class NetworkXGraphService(GraphService):
                 nd["flags"] = [f for f in nd["flags"] if f not in ("Mule ring", "Cashout exit", "Shared device")]
         self._rings, self._wallet_to_ring, self._ring_assoc = {}, {}, set()
 
+        # Membership needs BEHAVIOUR, not just one shared edge (M2.1): a suspect must mostly forward money onward into
+        # other suspects or to a cash-out agent, and two suspects are linked only when one actually forwarded
+        # received money to the other. A victim who happens to forward twice and also paid a hub is no longer a member.
+        conf = self._member_confidence()
+        suspects = {w for w in self._wallet_since if conf.get(w, 0.0) >= RING_MIN_CONF}
+        self._member_conf = {w: round(conf[w], 2) for w in suspects}
         H = nx.Graph()
-        H.add_nodes_from(self._wallet_since)
-        for u in self._wallet_since:
-            if u in self.G:
-                for _, v, k in self.G.out_edges(u, keys=True):
-                    if k == "transfer" and v in self._wallet_since:
-                        H.add_edge(u, v)
+        H.add_nodes_from(suspects)
+        for u in suspects:
+            for _t, _dwell, out_txn in self._events.get(u, ()):
+                info = self._txn_lookup.get(out_txn)
+                if info and info["type"] == "transfer" and info["rcpt"] in suspects and info["rcpt"] != u:
+                    H.add_edge(u, info["rcpt"])
 
         for comp in nx.connected_components(H):
             if len(comp) < 2:
@@ -213,6 +238,7 @@ class NetworkXGraphService(GraphService):
                 total_inflow_bdt=round(inflow, 2), total_outflow_bdt=round(outflow, 2), victim_wallets=len(victims),
                 shared_devices=shared, cashout_agents=sorted(agents), first_seen=_iso(min(firsts)),
                 last_seen=_iso(max(firsts)), flags=flags,
+                member_confidence={w: self._member_conf.get(w, 0.0) for w in members},
                 evidence_ids=[eid_ring(rid)] + [eid_wallet(w) for w in members[:3]] + [eid_device(d) for d in shared[:3]])
             for w in members:
                 self._wallet_to_ring[w] = rid

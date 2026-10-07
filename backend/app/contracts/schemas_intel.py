@@ -59,6 +59,7 @@ class RingSummary(_M):
     last_seen: str
     flags: list[str] = []
     evidence_ids: list[str] = []
+    member_confidence: dict[str, float] = {}  # wallet -> 0..1 behavioural confidence that it is a real ring member (heuristic)
 
 
 class FreezeRequest(_M):

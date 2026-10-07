@@ -25,7 +25,9 @@ class Settings(BaseSettings):
     auto_train: bool = False                  # run `python -m ml.train` on boot if the model artifact is missing
 
     # --- http
-    cors_origins: list[str] = ["*"]
+    # Explicit allow-list (J4). The dashboard is served by this same app, so it needs no CORS at all; list extra
+    # front-end origins in UPAY_CORS_ORIGINS (JSON list). "*" is no longer the default.
+    cors_origins: list[str] = ["http://localhost:8000", "http://127.0.0.1:8000"]
 
     # --- stream simulator (dashboard "Live transactions")
     stream_default_interval_ms: int = 3500
