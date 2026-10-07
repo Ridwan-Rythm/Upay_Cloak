@@ -1,5 +1,7 @@
 # UpayShield (Upay_Cloak): AI fraud protection for mobile money
 
+> **Phase 2 status:** see `docs/AUDIT.md` (what was verified and fixed), `docs/RESULTS.md` (the only numbers you may quote, with labels) and `docs/LIMITATIONS.md`. Phase 2 is **partly done**: ML depth (ablation, unseen patterns, calibration), PostgreSQL, authentication/RBAC, Docker and load tests are **not built yet**. The backend, tests and lint were not runnable in the audit sandbox.
+
 A trained ML model scores every transaction; a FastAPI backend turns the score into a decision, a case and a plain-language explanation; a static dashboard shows it. All data is **synthetic**.
 
 ## What it detects
@@ -19,7 +21,7 @@ pip install -r requirements.txt
 python scripts/generate_data.py      # optional: data/ is committed (seed 42, reproducible)
 python -m ml.train                   # trains, tunes thresholds, writes models/, reports/, data/cache/
 uvicorn backend.main:app --port 8000 # open http://localhost:8000
-python -m pytest tests -q            # 47 tests
+python -m pytest tests -q            # 52 tests collected (47 + 5 mule-ring tests); NOT run in the Phase 2 audit sandbox
 ```
 If `models/risk_engine.joblib` is missing the API starts in degraded mode (scoring endpoints return `503 model_not_loaded`); set `UPAY_AUTO_TRAIN=true` to train on boot.
 
@@ -43,15 +45,15 @@ Model selected by time-series CV (not a single noisy split): **LightGBM**.
 | **LightGBM** | **0.949** | 0.998 | **0.920** |
 | Isolation Forest | n/a | 0.975 | 0.675 |
 
-Business impact: **94.0%** of fraud value prevented, **1.26%** of legitimate transactions get friction. Precision by action: allow 0.04% fraud, step-up 2.8%, hold 10.7%, block 86%. Recall by scenario (any action): ATO, gambling, mule, structuring, rogue agent 100%; OTP breach 93%; scam victim 92% (hold/block only 88%). Brier 0.005. Scoring latency about 20 ms.
+Business impact (**PROJECTED**, synthetic data): **94.0%** of fraud *value* would be prevented **if** step-up / hold / block stop 50% / 80% / 95% of the money (assumed in `ml/decision.py`, not measured); **1.26%** of legitimate transactions get friction (reported by `ml.train`, not re-run in the audit). Precision by action: allow 0.04% fraud, step-up 2.8%, hold 10.7%, block 86%. Recall by scenario (any action): ATO, gambling, mule, structuring, rogue agent 100%; OTP breach 93%; scam victim 92% (hold/block only 88%). Brier 0.005 (not re-verified). Latency: NOT MEASURED (no load test yet).
 
-**Be honest about limits:** data is synthetic with 6% label noise, so absolute numbers are optimistic. Scam victims are the hardest class (a legitimate large first-time transfer looks the same), and about 14% of "block"s are such legitimate one-offs. Betting detection relies on knowing the merchant category. Scores are class-weighted ranking scores, not calibrated probabilities.
+**Be honest about limits:** data is synthetic with 6% label noise, so absolute numbers are optimistic. Scam victims are the hardest class (a legitimate large first-time transfer looks the same), and about 14% of "block"s are such legitimate one-offs. Betting detection relies on knowing the merchant category. Scores are class-weighted ranking scores, not calibrated probabilities (call them "risk score", never "probability").
 
 ## Bugs fixed in this version
 - Backend never called the ML (`/score` was `if amount > 30000`, cases/KPIs/metrics hard-coded, thresholds 0.20/0.25/0.30 hard-coded). Now everything comes from the model.
 - Stale `transactions.csv` with colliding txn ids was loaded instead of the model's data (removed).
 - Model selection picked the worst model on test (Random Forest) from one tiny validation slice; now time-series CV. `ml/evaluate.py` imported a function that didn't exist; duplicated, diverging rule code merged.
-- Mule detector flagged 870 innocent wallets/agents as 732 "rings"; now 6 rings, 24/24 mules. Agent policy held 158 legitimate customers; ATO rule blocked travellers; thresholds missed the rogue agents. Fake seeded agents / fake freeze numbers removed.
+- Mule detector flagged 870 innocent wallets/agents as 732 "rings"; now 6 rings, 24/24 mules, and (Phase 2) ring members must behave like mules, which removed stray ATO victims that appeared on 7 of 31 generator seeds (`reports/mule_rings.md`). Agent policy held 158 legitimate customers; ATO rule blocked travellers; thresholds missed the rogue agents. Fake seeded agents / fake freeze numbers removed.
 - "PDF" report was Markdown bytes; LLM path always called Gemini and accepted uncited sentences; "hold" was stored as a fraud verdict and the feedback CSV couldn't be read by `ml.feedback`; errors now use the contract shape.
 - Frontend: POSTs lacked `Content-Type`, errors were ignored, the feed was generated in the browser, graph searched `/graph/null`, evidence chips threw, root-level duplicate pages removed.
 
