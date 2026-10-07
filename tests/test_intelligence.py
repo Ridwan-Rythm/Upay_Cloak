@@ -13,7 +13,7 @@ def test_rings_are_mules_not_busy_wallets(container, history):
     mules = set(history[history.user_id.str.startswith("MU")].user_id) | set(history[history.recipient_id.str.startswith("MU")].recipient_id)
     assert len(g.rings()) == 6                         # the generator injects 6 rings
     assert len(flagged & mules) >= 0.9 * len(mules)    # finds (nearly) every mule ...
-    assert len(flagged - mules) <= 2                   # ... and almost nothing else
+    assert flagged - mules == set()                    # ... and nothing else (tightened from <= 2 in M2.1)
     import re
     assert not any(re.fullmatch(r"(A|M|G)\d{3}|BK\d{2}", w) for w in flagged)      # no agents / merchants / betting sites / bookies
 

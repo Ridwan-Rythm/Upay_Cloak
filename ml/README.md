@@ -1,6 +1,6 @@
 > **Updated:** 32 features (adds betting, spending-category and OTP/session signals); model chosen by time-series CV; `ml/live.py` scores single transactions with the same feature code; reports are `reports/metrics.json`, `model_comparison.md`, `shap_importance.json`. See the root README for current numbers.
 
-# UpayShield ML module (v1.1)
+# UpayShield ML module
 
 Everything the backend needs from the ML side: a trained risk engine, per-transaction explanations,
 a pre-scored cache for instant startup, and an analyst-feedback loop.
@@ -17,7 +17,7 @@ python -m ml.score                       # demo: the 3 riskiest test transaction
 
 | File | Role |
 |---|---|
-| `features.py` | 23 point-in-time features (no future leakage) |
+| `features.py` | 32 model features (`FEATURES`), built point-in-time over the whole timeline in order |
 | `anomaly.py` | Isolation Forest behavioural anomaly score (0..1 percentile) |
 | `train.py` | Compares Logistic Regression / Random Forest / LightGBM / Isolation Forest, tunes action thresholds, saves the artifact, builds the cache |
 | `decision.py` | Risk score to `allow / otp_step_up / hold / block`, thresholds tuned on cost |
@@ -60,7 +60,7 @@ from ml.cache import load_cache
 df = load_cache()      # ~1.7 s; builds once (about 18 s) if the file is missing
 ```
 
-`data/cache/scored_cache.parquet` holds every transaction with its raw columns, the 23 features, `split`,
+`data/cache/scored_cache.parquet` holds every transaction with its raw columns, the 32 features, `split`,
 `risk_score`, `anomaly_score`, `action`, `tags`, and `reasons` (JSON string with the top positive and negative
 factors, filled for flagged rows only). Rebuild it after any retrain or threshold change
 (`python -m ml.cache`). For a different dataset: `python -m ml.cache --csv a.csv b.csv` (files in time order).

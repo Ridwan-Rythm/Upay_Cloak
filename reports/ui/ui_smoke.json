@@ -1,0 +1,139 @@
+[
+ {
+  "page": "index.html",
+  "size": "phone",
+  "overflow_px": 0,
+  "third_party": 0,
+  "js_errors": [
+   "Cannot set properties of null (setting 'innerHTML')",
+   "Cannot set properties of null (setting 'innerHTML')",
+   "Cannot set properties of null (setting 'textContent')"
+  ]
+ },
+ {
+  "page": "case.html",
+  "size": "phone",
+  "overflow_px": 0,
+  "third_party": 0,
+  "js_errors": []
+ },
+ {
+  "page": "graph.html",
+  "size": "phone",
+  "overflow_px": 0,
+  "third_party": 0,
+  "js_errors": []
+ },
+ {
+  "page": "demo.html",
+  "size": "phone",
+  "overflow_px": 0,
+  "third_party": 0,
+  "js_errors": []
+ },
+ {
+  "page": "settings.html",
+  "size": "phone",
+  "overflow_px": 0,
+  "third_party": 0,
+  "js_errors": []
+ },
+ {
+  "page": "help.html",
+  "size": "phone",
+  "overflow_px": 0,
+  "third_party": 0,
+  "js_errors": []
+ },
+ {
+  "page": "index.html",
+  "size": "tablet",
+  "overflow_px": 0,
+  "third_party": 0,
+  "js_errors": [
+   "Cannot set properties of null (setting 'innerHTML')",
+   "Cannot set properties of null (setting 'textContent')"
+  ]
+ },
+ {
+  "page": "case.html",
+  "size": "tablet",
+  "overflow_px": 0,
+  "third_party": 0,
+  "js_errors": []
+ },
+ {
+  "page": "graph.html",
+  "size": "tablet",
+  "overflow_px": 0,
+  "third_party": 0,
+  "js_errors": []
+ },
+ {
+  "page": "demo.html",
+  "size": "tablet",
+  "overflow_px": 0,
+  "third_party": 0,
+  "js_errors": []
+ },
+ {
+  "page": "settings.html",
+  "size": "tablet",
+  "overflow_px": 0,
+  "third_party": 0,
+  "js_errors": []
+ },
+ {
+  "page": "help.html",
+  "size": "tablet",
+  "overflow_px": 0,
+  "third_party": 0,
+  "js_errors": []
+ },
+ {
+  "page": "index.html",
+  "size": "desktop",
+  "overflow_px": 0,
+  "third_party": 0,
+  "js_errors": [
+   "Cannot set properties of null (setting 'innerHTML')",
+   "Cannot set properties of null (setting 'innerHTML')",
+   "Cannot set properties of null (setting 'textContent')"
+  ]
+ },
+ {
+  "page": "case.html",
+  "size": "desktop",
+  "overflow_px": 0,
+  "third_party": 0,
+  "js_errors": []
+ },
+ {
+  "page": "graph.html",
+  "size": "desktop",
+  "overflow_px": 0,
+  "third_party": 0,
+  "js_errors": []
+ },
+ {
+  "page": "demo.html",
+  "size": "desktop",
+  "overflow_px": 0,
+  "third_party": 0,
+  "js_errors": []
+ },
+ {
+  "page": "settings.html",
+  "size": "desktop",
+  "overflow_px": 0,
+  "third_party": 0,
+  "js_errors": []
+ },
+ {
+  "page": "help.html",
+  "size": "desktop",
+  "overflow_px": 0,
+  "third_party": 0,
+  "js_errors": []
+ }
+]

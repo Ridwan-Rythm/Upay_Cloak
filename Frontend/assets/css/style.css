@@ -1,3 +1,7 @@
+/* Self-hosted fonts (M2.9): no third-party requests. Drop the woff2 files listed in assets/fonts/README.md next to this
+   folder; until then the browser falls back to locally installed fonts, then system-ui. */
+@font-face{font-family:'Plus Jakarta Sans';font-weight:400 800;font-display:swap;src:local('Plus Jakarta Sans'),url('../fonts/PlusJakartaSans-var.woff2') format('woff2')}
+@font-face{font-family:'Noto Sans Bengali';font-weight:400 700;font-display:swap;src:local('Noto Sans Bengali'),url('../fonts/NotoSansBengali-var.woff2') format('woff2')}
 :root{--ink:#0A2A63;--brand:#0B4AA6;--brand-d:#083A85;--b2:#1A63D1;--yel:#FFD21F;--yel2:#FFF4C2;--bg:#E9ECF2;--soft:#F3F5F9;--line:#E6EAF2;--tx:#14213D;--mut:#8590A8;--low:#1B9E6A;--med:#D99A0B;--high:#EC6A1E;--crit:#D32C45;--tex:repeating-radial-gradient(circle at 100% 100%,transparent 0 12px,#ffffff10 12px 13px)}
 *{box-sizing:border-box;margin:0}
 body{font:400 14px/1.45 'Plus Jakarta Sans','Noto Sans Bengali',system-ui,sans-serif;background:var(--bg);color:var(--tx);padding:16px}
@@ -83,3 +87,10 @@ table{width:100%;border-collapse:collapse}th{text-align:left;color:var(--mut);fo
 .dl{display:grid;grid-template-columns:130px 1fr;gap:10px 16px}.dl dt{font-weight:600}.dl dd{color:#55607A}
 @media(max-width:800px){.s12{grid-column:span 12}.dl{grid-template-columns:1fr;gap:2px}.dl dd{margin-bottom:10px}}
 .evrow{padding:5px 0;border-bottom:1px solid #EEF2F4;font-size:12px;word-break:break-word}.evrow.hl,.tl .hl{background:#FFF6D6}.ctrl .btn.on{background:var(--brand,#0B4AA6);color:#fff}
+
+/* M1.2: phone navigation drawer + overflow fixes */
+.menu-btn{display:none;width:42px;height:42px;border-radius:50%;border:1px solid var(--line);background:#fff;color:var(--tx);place-items:center;cursor:pointer;flex:none}.menu-btn svg{width:20px}
+.scrim{display:none}.gnet{grid-template-columns:1fr 300px}
+@media(max-width:900px){.gnet{grid-template-columns:1fr}.gnet #net{height:62vh!important;min-height:360px}}
+@media(max-width:800px){.menu-btn{display:grid}.top{gap:8px;padding:10px 12px}.top .sb{flex:1 1 0;min-width:0}.top .ic{display:none}.side{display:flex;position:fixed;left:8px;top:8px;bottom:8px;height:auto;z-index:50;width:min(280px,86vw);transform:translateX(-115%);transition:transform .25s ease;box-shadow:none}.side.open{transform:none;box-shadow:0 20px 60px rgba(10,20,40,.35)}.scrim.on{display:block;position:fixed;inset:0;background:rgba(10,20,40,.4);z-index:40}}
+@media(max-width:800px) and (prefers-reduced-motion:reduce){.side{transition:none}}

@@ -20,7 +20,7 @@ Backend Part 2 (intelligence layer) fit together. The Python versions of these c
 | Errors | Always `{"error": {"code": str, "message": str, "details": {...}|null}}` (`ErrorResponse`). Codes are `snake_case`: `case_not_found`, `txn_not_found`, `ring_not_found`, `agent_not_found`, `validation_error`, `model_not_loaded`, `report_missing`, `internal_error`. |
 | Status codes | 200 OK · 201 created · 404 not found · 422 validation · 503 only when the ML artifacts or reports are missing (`model_not_loaded`, `report_missing`). **The LLM path never returns 5xx**: it falls back to the template narrative. |
 | Pagination | `?limit=50&cursor=<opaque>` → `Page{items,total,next_cursor}`. |
-| CORS | Allow all origins by default (static frontend opened from file/other port). |
+| CORS | Explicit allow-list from `UPAY_CORS_ORIGINS` (default: localhost:8000 only; the UI is served by the API itself). Methods GET/POST/OPTIONS. |
 | Idempotency | `case_id = "CASE-" + txn_id suffix` (e.g. `TXN-0062110` → `CASE-0062110`). Re-scoring the same txn never duplicates a case. |
 | Labels | `is_fraud` / `scenario` are **dataset labels**. They may be used for evaluation and the freeze what-if only, never as model/graph/agent inputs, never in customer-facing output. |
 

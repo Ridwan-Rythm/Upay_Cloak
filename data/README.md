@@ -1,31 +1,19 @@
-> **Updated:** new columns `merchant_category`, `otp_requests_10m`, `otp_failures_10m`, `otp_device_mismatch`, `concurrent_sessions`, `sim_swap_recent`; scenarios `otp_breach` and `gambling`. `is_fraud` = illicit or unauthorized activity (including prohibited betting). `transactions.csv` was removed (stale).
+# Sample dataset (SYNTHETIC)
 
-# Sample dataset
+Our own synthetic, Bangladesh-flavoured mobile-money dataset (BDT amounts, Dhaka/Chattogram-style locations, salary-day spikes).
+Reproducible with `python scripts/generate_data.py --seed 42`. **No real customer data; accuracy measured on it is optimistic.**
+Row counts, prevalence, scenario mix and leakage checks are generated, never typed: see **`DATA_CARD.md`** and `docs/DATASET.md`
+(`python -m ml.dataset_stats`).
 
-Our own synthetic, Bangladesh-flavoured mobile-money dataset (BDT amounts, Dhaka/Chattogram-style
-locations, salary-day spikes, bKash/Nagad-like transaction types). It is committed to git as the
-organizers asked, and is fully reproducible with `python scripts/generate_data.py --seed 42`.
+| File | Purpose |
+|---|---|
+| `train.csv` | first 70% of the timeline; `ml/train.py` carves the last 20% of it (by time) as validation |
+| `test.csv` | last 30% of the timeline, used only for the final report |
 
-| File | Rows | Period | Purpose |
-|---|---|---|---|
-| `train.csv` | ~22.5k | first 70% of the timeline (Jan 1-23) | model training + validation |
-| `test.csv` | ~9.6k | last 30% (Jan 23-30) | final, untouched evaluation |
-
-The split is **time-based** (no shuffling), so the model never sees the future.
+`transactions.csv` (an older dataset whose txn ids collided with `train.csv`) was deleted in the Phase 2 audit.
 
 ## Columns
-| Column | Meaning |
-|---|---|
-| `txn_id` | unique transaction id |
-| `ts` | timestamp |
-| `user_id` | sender wallet |
-| `type` | CASH_IN, CASH_OUT, TRANSFER, PAYMENT |
-| `amount` | BDT |
-| `recipient_id` | receiving wallet / agent / merchant |
-| `agent_id` | agent for cash-in/out (empty otherwise) |
-| `device_id`, `location` | device used and city |
-| `balance_before` | sender balance before the transaction |
-| `is_fraud` | label (about 6% of true fraud is deliberately left unlabeled to mimic unreported fraud) |
-| `scenario` | ground-truth scenario: normal, ato, scam_victim, mule_passthrough, structuring, rogue_agent (analysis only, never a model input) |
-
-Fraud rate is about 3% (higher than real life, to give the models enough positives).
+`txn_id, ts, user_id, type (CASH_IN/CASH_OUT/TRANSFER/PAYMENT), amount (BDT), recipient_id, agent_id, device_id, location, balance_before,
+merchant_category, otp_requests_10m, otp_failures_10m, otp_device_mismatch, concurrent_sessions, sim_swap_recent, is_fraud, scenario`.
+`is_fraud` is the label (about 6% of injected fraud is deliberately left 0 as unreported fraud); `scenario` is the ground-truth typology
+(analysis only, never a model input).
