@@ -1,0 +1,30 @@
+services:
+  api:
+    build: .
+    image: upayshield-api:latest
+    ports:
+      - "8000:8000"
+    # .env is optional (needs Docker Compose >= 2.24); the app runs with its defaults without it.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # `environment:` wins over env_file, so a copied env.example cannot move the database out of the volume.
+      UPAY_DB_PATH: /app/dbdata/upayshield.db
+    volumes:
+      # Only the directory holding upayshield.db, so the CSVs, cache and model are not hidden.
+      - upay_db:/app/dbdata
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json,sys,urllib.request; r=json.load(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4)); sys.exit(0 if r.get('status')=='ok' else 1)"
+      interval: 30s
+      timeout: 5s
+      start_period: 90s
+      retries: 3
+
+volumes:
+  upay_db:

@@ -1,6 +1,6 @@
 # UpayShield (Upay_Cloak): AI fraud protection for mobile money
 
-> **Phase 2 status:** see `docs/AUDIT.md` (what was verified and fixed), `docs/RESULTS.md` (the only numbers you may quote, with labels) and `docs/LIMITATIONS.md`. Phase 2 is **partly done**: ML depth (ablation, unseen patterns, calibration), PostgreSQL, authentication/RBAC, Docker and load tests are **not built yet**. The backend, tests and lint were not runnable in the audit sandbox.
+> **Phase 2 status:** see `docs/AUDIT.md` (what was verified and fixed), `docs/RESULTS.md` (the only numbers you may quote, with labels) and `docs/LIMITATIONS.md`. Phase 2 is **partly done**: ML depth (ablation, unseen patterns, calibration), PostgreSQL, authentication/RBAC and load tests are **not built yet** (Docker: single-container setup added, see "Run with Docker"; not yet run end to end). The backend, tests and lint were not runnable in the audit sandbox.
 
 A trained ML model scores every transaction; a FastAPI backend turns the score into a decision, a case and a plain-language explanation; a static dashboard shows it. All data is **synthetic**.
 
@@ -24,6 +24,22 @@ uvicorn backend.main:app --port 8000 # open http://localhost:8000
 python -m pytest tests -q            # 52 tests collected (47 + 5 mule-ring tests); NOT run in the Phase 2 audit sandbox
 ```
 If `models/risk_engine.joblib` is missing the API starts in degraded mode (scoring endpoints return `503 model_not_loaded`); set `UPAY_AUTO_TRAIN=true` to train on boot.
+
+## Run with Docker
+One container serves the API and the dashboard (no separate frontend container, no new services).
+
+**Prerequisites:** Docker Engine/Desktop with Compose v2.24 or newer (needed for the optional `.env`). `make` is optional.
+
+```bash
+cp env.example .env            # optional: the app runs with its defaults without a .env
+docker compose up --build      # or: make docker-up  (detached)
+```
+- Open http://localhost:8000 (dashboard); `http://localhost:8000/health` should show `"status": "ok"`. Start-up replays the held-out period, so allow roughly 10-15 s (the healthcheck waits up to 90 s).
+- Stop: `docker compose down` (`make docker-down`). Logs: `make docker-logs`. Other targets: `make docker-build`.
+- **SQLite data** (analyst actions and feedback) is in the named volume `upay_db`, mounted at `/app/dbdata` (`UPAY_DB_PATH=/app/dbdata/upayshield.db`). It survives `docker compose down` and restarts; `docker compose down -v` deletes it.
+- **Model artifact:** at build time, `models/risk_engine.joblib` from your checkout is used if it exists and loads with the image's library versions; otherwise `python -m ml.train` runs during the build (the file is git-ignored, so a fresh clone trains once, which takes a while). The container then starts in seconds-to-tens-of-seconds with no training on boot.
+- **Retrain:** `python -m ml.train` on the host and `docker compose up --build`, or delete `models/risk_engine.joblib` and rebuild with `docker compose build --no-cache api` to train inside the build.
+- `.env` is git-ignored and never copied into the image; set `UPAY_LLM_*` there if you want the optional LLM assistant.
 
 ## How the backend uses the ML
 `ScoringService` loads the model and replays history into a rolling feature state (same code as training, tested to match). The held-out test period is replayed through the model at start-up; every non-allow becomes a case. Pages: **Dashboard** (live model-scored feed), **Cases** (what happened / why risky / what next, baseline, purpose, evidence, grounded Q&A, analyst actions), **Graph**, **Warning demo** (real transactions, editable amount/recipient, scored live, EN/বাংলা).
@@ -58,4 +74,4 @@ Business impact (**PROJECTED**, synthetic data): **94.0%** of fraud *value* woul
 - Frontend: POSTs lacked `Content-Type`, errors were ignored, the feed was generated in the browser, graph searched `/graph/null`, evidence chips threw, root-level duplicate pages removed.
 
 ## Layout
-`ml/` features, rules, train, live scorer · `backend/app/` api, services (scoring, decision), intelligence (graph, agents, assistant, reports), store · `Frontend/` dashboard · `scripts/generate_data.py` · `tests/` · `docs/`. Config: `.env.example`. Optional LLM: `UPAY_LLM_PROVIDER=gemini|anthropic|openai` + `UPAY_LLM_API_KEY` (answers must cite evidence ids, else template fallback).
+`ml/` features, rules, train, live scorer · `backend/app/` api, services (scoring, decision), intelligence (graph, agents, assistant, reports), store · `Frontend/` dashboard · `scripts/generate_data.py` · `tests/` · `docs/`. Config: `env.example`. Optional LLM: `UPAY_LLM_PROVIDER=gemini|anthropic|openai` + `UPAY_LLM_API_KEY` (answers must cite evidence ids, else template fallback).
