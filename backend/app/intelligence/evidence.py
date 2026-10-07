@@ -8,13 +8,29 @@ from datetime import datetime, timezone
 
 from backend.app.contracts.evidence_ids import (
     agent as eid_agent,
+)
+from backend.app.contracts.evidence_ids import (
     device as eid_device,
+)
+from backend.app.contracts.evidence_ids import (
     factor as eid_factor,
+)
+from backend.app.contracts.evidence_ids import (
     metric as eid_metric,
+)
+from backend.app.contracts.evidence_ids import (
     policy as eid_policy,
+)
+from backend.app.contracts.evidence_ids import (
     ring as eid_ring,
+)
+from backend.app.contracts.evidence_ids import (
     rule as eid_rule,
+)
+from backend.app.contracts.evidence_ids import (
     txn as eid_txn,
+)
+from backend.app.contracts.evidence_ids import (
     wallet as eid_wallet,
 )
 from backend.app.contracts.interfaces import EvidenceBuilder
@@ -45,13 +61,15 @@ class StructuredEvidenceBuilder(EvidenceBuilder):
             EvidenceItem(
                 id=tid_eid,
                 kind=EvidenceKind.TXN,
-                label=f"{wh.type} transaction of ৳{wh.amount_bdt:,.0f}",
+                label=f"{wh.type} of ৳{wh.amount_bdt:,.0f} from {scored.user_id} to {wh.recipient} at {wh.time}",
                 facts={
                     "txn_id": scored.txn_id,
                     "amount_bdt": float(wh.amount_bdt),
                     "type": wh.type,
                     "time": wh.time,
                     "location": wh.location,
+                    "purpose": wh.purpose or "unknown",
+                    "merchant_category": wh.merchant_category or "none",
                 },
             )
         )
@@ -108,7 +126,7 @@ class StructuredEvidenceBuilder(EvidenceBuilder):
             EvidenceItem(
                 id=score_eid,
                 kind=EvidenceKind.METRIC,
-                label=f"Blended risk score {wr.risk_score:.2f} ({wn.risk_level.value})",
+                label=f"Model risk score {wr.risk_score:.2f} ({wn.risk_level.value})",
                 facts={
                     "risk_score": round(wr.risk_score, 4),
                     "model_score": round(wr.model_score, 4),

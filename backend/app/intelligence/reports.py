@@ -1,7 +1,7 @@
-"""Report Exporter for UpayShield.
-Generates structured Markdown and PDF compliance summaries.
-"""
+"""Compliance report exporter: Markdown and a real PDF (reportlab)."""
 from __future__ import annotations
+
+import io
 
 from backend.app.contracts.interfaces import ReportExporter
 from backend.app.contracts.schemas import Case
@@ -10,62 +10,61 @@ from backend.app.contracts.schemas_intel import EvidenceBundle, Narrative
 
 class MarkdownReportExporter(ReportExporter):
     def to_markdown(self, case: Case, bundle: EvidenceBundle, narrative: Narrative) -> str:
-        wh = case.scored.what_happened
-        wn = case.scored.what_next
-        wr = case.scored.why_risky
-
-        lines = [
+        wh, wn, wr = case.scored.what_happened, case.scored.what_next, case.scored.why_risky
+        L = [
             f"# UpayShield Investigation Report: {case.case_id}",
             f"**Generated:** {bundle.generated_at.strftime('%Y-%m-%d %H:%M:%S UTC')}",
-            f"**Alert Type:** {case.alert_type.value if case.alert_type else 'Anomaly'}",
-            f"**Risk Level:** {wn.risk_level.value.upper()} (Score: {wr.risk_score:.2f})",
-            f"**Recommended Action:** {wn.action.value.upper()}",
-            "",
-            "## 1. What Happened?",
+            f"**Alert type:** {case.alert_type.value if case.alert_type else 'anomaly'}",
+            f"**Risk level:** {wn.risk_level.value.upper()} (model score {wr.risk_score:.2f})",
+            f"**Recommended action:** {wn.action.value.upper()}  (model alone: {wn.base_action.value})", "",
+            "## 1. What happened?",
             f"- **Transaction:** {wh.type} of ৳{wh.amount_bdt:,.2f}",
-            f"- **Sender:** {case.scored.user_id}",
-            f"- **Recipient:** {wh.recipient}",
-            f"- **Device / Location:** {wh.device} ({wh.location})",
-            f"- **Timestamp:** {wh.time}",
-            "",
-            "## 2. Why is it Risky?",
-            f"- **Model Score:** {wr.model_score:.4f}",
-            f"- **Anomaly Score:** {wr.anomaly_score:.4f}",
+            f"- **Purpose of the money:** {(wh.purpose or 'unknown').replace('_', ' ')}"
+            + (f" ({wh.merchant_category})" if wh.merchant_category else ""),
+            f"- **Sender:** {case.scored.user_id}", f"- **Recipient:** {wh.recipient}",
+            f"- **Device / location:** {wh.device} ({wh.location})", f"- **Time:** {wh.time}", "",
+            "## 2. Why is it risky?",
+            f"- **Model score:** {wr.model_score:.4f}   **Anomaly score:** {wr.anomaly_score:.4f}",
         ]
-
         if wr.rule_trace:
-            lines.append("### Fired Rules:")
-            for r in wr.rule_trace:
-                lines.append(f"- `[{r.rule_id}]` {r.text} (tag: {r.tag})")
-
-        if wr.reasons:
-            lines.append("### Key Contributing Factors:")
-            for factor in wr.reasons:
-                lines.append(f"- **{factor.feature}:** {factor.text} (SHAP contribution: {factor.shap:+.2f})")
-
-        lines.extend([
-            "",
-            "## 3. Recommended Actions",
-            f"1. **{wn.action.value.upper()}**: Priority level ৳{wn.priority:,.2f}.",
-            f"2. Base threshold recommendation: {wn.base_action.value}.",
-            "",
-            "## 4. Grounded AI Narrative",
-            "### Summary of Facts:",
-        ])
-        for s in narrative.what_happened:
-            lines.append(f"> {s.text} *[Evidence: {', '.join(s.evidence_ids)}]*")
-
-        lines.append("### Risk Explanation:")
-        for s in narrative.why_risky:
-            lines.append(f"> {s.text} *[Evidence: {', '.join(s.evidence_ids)}]*")
-
-        lines.append("### Next Steps:")
-        for s in narrative.what_next:
-            lines.append(f"> {s.text} *[Evidence: {', '.join(s.evidence_ids)}]*")
-
-        return "\n".join(lines) + "\n"
+            L.append("### Rules that fired")
+            L += [f"- `[{r.rule_id}]` {r.text}" for r in wr.rule_trace]
+        pos = [f for f in wr.reasons if f.shap > 0]
+        if pos:
+            L.append("### Model factors that raised the risk")
+            L += [f"- {f.text} (contribution {f.shap:+.2f})" for f in pos]
+        if wr.graph and wr.graph.ring_id:
+            L.append(f"### Network\n- Wallet belongs to mule ring **{wr.graph.ring_id}** (ring score {wr.graph.ring_score:.2f})")
+        L += ["", "## 3. What should be done next?", f"1. **{wn.action.value.upper()}** (priority ৳{wn.priority:,.0f})."]
+        L += [f"   - Policy `{p.policy_id}`: {p.text}" for p in wn.policy_trace]
+        L += ["", "## 4. Grounded narrative"]
+        for title, sents in (("Facts", narrative.what_happened), ("Risk", narrative.why_risky), ("Next steps", narrative.what_next)):
+            L.append(f"### {title}")
+            L += [f"> {s.text} *[{', '.join(s.evidence_ids)}]*" for s in sents]
+        L += ["", f"_Narrative source: {narrative.source}; evidence items: {len(bundle.items)}._"]
+        return "\n".join(L) + "\n"
 
     def to_pdf(self, case: Case, bundle: EvidenceBundle, narrative: Narrative) -> bytes:
-        # Generate minimal valid PDF or formatted text bytes
-        md = self.to_markdown(case, bundle, narrative)
-        return md.encode("utf-8")
+        from xml.sax.saxutils import escape
+
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+
+        styles = getSampleStyleSheet()
+        buf = io.BytesIO()
+        doc = SimpleDocTemplate(buf, pagesize=A4, title=f"UpayShield {case.case_id}")
+        story = []
+        for line in self.to_markdown(case, bundle, narrative).splitlines():
+            if not line.strip():
+                story.append(Spacer(1, 6))
+                continue
+            text = escape(line.replace("**", "").replace("`", "").replace("*", "").replace("_", " "))
+            # the built-in PDF fonts have no Bangla / ৳ glyphs: keep the report readable with ASCII currency
+            text = text.replace("৳", "BDT ")
+            text = text.encode("latin-1", "replace").decode("latin-1")
+            style = styles["Heading1"] if line.startswith("# ") else styles["Heading2"] if line.startswith("## ") else \
+                styles["Heading3"] if line.startswith("### ") else styles["BodyText"]
+            story.append(Paragraph(text.lstrip("#> ").strip(), style))
+        doc.build(story)
+        return buf.getvalue()

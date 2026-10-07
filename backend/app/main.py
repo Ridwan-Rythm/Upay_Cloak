@@ -1,131 +1,76 @@
-"""Central FastAPI entrypoint for UpayShield.
-Combines Core API (Part 1), Intelligence Services (Part 2), Frontend Routes,
-and static frontend hosting into a single unified application.
-"""
+"""FastAPI entrypoint: core API (/api/v1), intelligence API (/api/v1), frontend API (/api) and the static UI."""
 from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from pathlib import Path
-from typing import Any
 
-from fastapi import Body, FastAPI
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from backend.app.api import routes_core, routes_frontend, routes_intel
+from backend.app.api import routes_core, routes_frontend, routes_intel, routes_ops
 from backend.app.config import ROOT, get_settings
-from backend.app.contracts.interfaces import Container
-from backend.app.deps import get_container, set_container
-from backend.app.intelligence import build_intelligence
-from backend.app.store.case_store import CaseStore
+from backend.app.deps import build_container, get_container, set_container
 
 logger = logging.getLogger("upayshield")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup & shutdown sequence for UpayShield."""
-    settings = get_settings()
-    logger.info("Initializing UpayShield Backend...")
-
-    # 1. Initialize store & data
-    store = CaseStore(txns_path=settings.data_path, reports_dir=settings.reports_dir)
-
-    # 2. Build live intelligence services (NetworkX graph, agent analytics, assistant)
-    intel = build_intelligence(settings, live=True)
-
-    # 3. Populate graph & agent models with transaction history
-    df = store.history_frame()
-    if not df.empty:
-        logger.info(f"Building graph and agent models from {len(df)} transactions...")
-        intel.graph.build(df)
-        intel.agents.build(df)
-
-    # 4. Wire dependency container
-    container = Container(cases=store, intel=intel)
-    set_container(container)
-    logger.info("UpayShield Backend initialisation complete!")
-
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    set_container(build_container(get_settings()))
     yield
-
-    # Shutdown
     set_container(None)
+
+
+def _error(status: int, code: str, message: str, details: dict | None = None) -> JSONResponse:
+    return JSONResponse(status_code=status, content={"error": {"code": code, "message": message, "details": details}})
 
 
 def create_app() -> FastAPI:
     settings = get_settings()
-
     app = FastAPI(
         title="UpayShield Trust & Risk Intelligence API",
-        description="Case-centric fraud detection, graph analytics, and AI compliance assistant for mobile money.",
-        version="1.0.0",
-        lifespan=lifespan,
-    )
+        description="Case-centric fraud detection, graph analytics and a grounded AI assistant for mobile money.",
+        version="1.1.0", lifespan=lifespan)
+    app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origins, allow_credentials=False,
+                       allow_methods=["*"], allow_headers=["*"])
 
-    # Enable CORS for static frontend / external calls
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=settings.cors_origins,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    # every error uses the contract shape {"error": {"code", "message", "details"}}
+    @app.exception_handler(StarletteHTTPException)
+    async def http_error(_: Request, exc: StarletteHTTPException):
+        detail = exc.detail
+        if isinstance(detail, dict) and "error" in detail:
+            return JSONResponse(status_code=exc.status_code, content=detail)
+        code = {404: "not_found", 405: "method_not_allowed", 503: "service_unavailable"}.get(exc.status_code, f"http_{exc.status_code}")
+        return _error(exc.status_code, code, str(detail))
 
-    # Include API Routers
-    app.include_router(routes_core.router)        # /api/v1/score, /api/v1/cases, /api/v1/config...
-    app.include_router(routes_intel.router)       # /api/v1/graph, /api/v1/agents, /api/v1/cases/{id}/ask...
-    app.include_router(routes_frontend.router)    # /api/overview, /api/transactions, /api/cases...
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(_: Request, exc: RequestValidationError):
+        return _error(422, "validation_error", "Request validation failed",
+                      {"errors": [{"loc": list(e["loc"]), "msg": e["msg"]} for e in exc.errors()]})
 
-    # Health check endpoint
-    @app.get("/health", tags=["system"])
-    def health_check() -> dict[str, Any]:
-        cnt = get_container()
-        return {
-            "status": "ok",
-            "model_loaded": settings.model_path.exists(),
-            "intelligence": "live" if cnt.intel.live else "stubs",
-            "cases_count": len(cnt.cases.list_cases()) if hasattr(cnt.cases, "list_cases") else 0,
-        }
+    app.include_router(routes_core.router)       # /api/v1/score, /cases, /config, /metrics, /warning/check
+    app.include_router(routes_ops.router)        # /api/v1/stream (SSE), /stream/control, /admin/thresholds/*
+    app.include_router(routes_intel.router)      # /api/v1/graph, /agents, /cases/{id}/evidence|narrative|ask|report
+    app.include_router(routes_frontend.router)   # /api/overview, /transactions, /stream, /cases, /graph, /score ...
 
-    # Direct aliases for frontend root-relative paths if called without /api prefix
-    @app.get("/overview", include_in_schema=False)
-    def root_overview():
-        return routes_frontend.get_frontend_overview(get_container())
+    @app.get("/health", tags=["meta"])
+    def health():
+        c = get_container()
+        sc = c.scoring
+        return {"status": "ok" if sc else "degraded", "model_loaded": sc is not None,
+                "model": sc.engine.name if sc else None, "model_version": sc.engine.version if sc else None,
+                "cases": len(getattr(c.cases, "_cases", {})), "intelligence": "live" if c.intel.live else "stubs"}
 
-    @app.get("/transactions", include_in_schema=False)
-    def root_transactions():
-        return routes_frontend.get_frontend_transactions(get_container())
-
-    @app.get("/cases", include_in_schema=False)
-    def root_cases(alert_type: str | None = None):
-        return routes_frontend.get_frontend_cases(alert_type, get_container())
-
-    @app.get("/cases/{case_id}", include_in_schema=False)
-    def root_case_by_id(case_id: str):
-        return routes_frontend.get_frontend_case(case_id, get_container())
-
-    @app.get("/graph/{entity_id}", include_in_schema=False)
-    def root_graph_by_id(entity_id: str):
-        return routes_frontend.get_frontend_graph_by_id(entity_id, 2, get_container())
-
-    @app.get("/graph", include_in_schema=False)
-    def root_graph(center: str | None = None):
-        return routes_frontend.get_frontend_full_graph(center, 2, get_container())
-
-    @app.post("/score", include_in_schema=False)
-    def root_score(payload: dict[str, Any] = Body(...)):
-        return routes_frontend.frontend_score_transaction(payload, get_container())
-
-    # Mount static frontend directory at /
-    frontend_dir = ROOT / "Frontend"
-    if not frontend_dir.exists():
-        frontend_dir = ROOT / "frontend"
-    if frontend_dir.exists():
-        app.mount("/", StaticFiles(directory=str(frontend_dir), html=True), name="frontend")
-        logger.info(f"Mounted static frontend from {frontend_dir}")
-
+    frontend = ROOT / "Frontend"
+    if frontend.exists():
+        app.mount("/", StaticFiles(directory=frontend, html=True), name="frontend")
     return app
 
 
 app = create_app()
+__all__ = ["app", "HTTPException"]

@@ -1,421 +1,364 @@
-"""Graph Analytics Service for UpayShield using NetworkX.
-Implements the GraphService protocol to detect mule rings, extract ego subgraphs,
-compute point-in-time network signals, and simulate wallet freezes.
+"""Graph analytics for UpayShield (NetworkX): mule-ring discovery, ego sub-graphs, wallet signals, freeze what-if.
+
+Mule detection is behavioural, not volume-based. A wallet shows RAPID PASS-THROUGH when it forwards
+(TRANSFER or CASH_OUT) 70-110% of money it received within 30 minutes. A wallet with >= 2 such events is a
+mule suspect; suspects that move money between each other form a ring (connected component, >= 2 wallets).
+Busy agents, merchants and popular wallets are never flagged just for receiving a lot of money.
+
+Everything is POINT-IN-TIME: a wallet only counts as a ring member from the moment it had shown its 2nd
+pass-through event, so replaying history never uses information from the future.
 """
 from __future__ import annotations
 
 import hashlib
+import statistics
 import time
 from collections import defaultdict
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import networkx as nx
 import pandas as pd
 
-from backend.app.contracts.evidence_ids import agent as eid_agent, device as eid_device, ring as eid_ring, wallet as eid_wallet
+from backend.app.contracts.evidence_ids import (
+    agent as eid_agent,
+)
+from backend.app.contracts.evidence_ids import (
+    device as eid_device,
+)
+from backend.app.contracts.evidence_ids import (
+    ring as eid_ring,
+)
+from backend.app.contracts.evidence_ids import (
+    wallet as eid_wallet,
+)
 from backend.app.contracts.interfaces import GraphService
 from backend.app.contracts.schemas import GraphSignals, Transaction
-from backend.app.contracts.schemas_intel import (
-    FreezeImpact,
-    GraphEdge,
-    GraphNode,
-    GraphView,
-    RingSummary,
-)
+from backend.app.contracts.schemas_intel import FreezeImpact, GraphEdge, GraphNode, GraphView, RingSummary
+
+PT_DWELL_S = 30 * 60          # forwarded within 30 minutes ...
+PT_LO, PT_HI = 0.7, 1.1       # ... at 70-110% of what came in
+PT_MIN_EVENTS = 2             # events needed before a wallet is a mule suspect
+NEIGHBOUR_CAP = 25            # per node when drawing ego graphs (keeps hubs readable)
+MAX_TXN_IDS = 10
+
+
+def _naive(dt: datetime | pd.Timestamp | None) -> datetime | None:
+    """Dataset timestamps are naive; treat any tz-aware input as UTC and drop the tzinfo."""
+    if dt is None:
+        return None
+    dt = pd.Timestamp(dt)
+    if dt.tzinfo is not None:
+        dt = dt.tz_convert("UTC").tz_localize(None)
+    return dt.to_pydatetime()
+
+
+def _iso(dt: datetime) -> str:
+    return dt.isoformat()
 
 
 class NetworkXGraphService(GraphService):
     def __init__(self) -> None:
+        self._reset()
+
+    def _reset(self) -> None:
         self.G: nx.MultiDiGraph = nx.MultiDiGraph()
         self._rings: dict[str, RingSummary] = {}
         self._wallet_to_ring: dict[str, str] = {}
-        self._ring_wallets: set[str] = set()
+        self._wallet_since: dict[str, datetime] = {}       # wallet -> when it became a mule suspect
+        self._ring_wallets: frozenset[str] = frozenset()
         self._txn_lookup: dict[str, dict[str, Any]] = {}
-        self._txns_df: pd.DataFrame | None = None
-        self._seed_demo_rings()
+        self._in: dict[str, list[tuple]] = defaultdict(list)    # wallet -> [(ts, amount, sender, txn_id)]
+        self._out: dict[str, list[tuple]] = defaultdict(list)   # wallet -> [(ts, amount, recipient, txn_id, type)]
+        self._events: dict[str, list[tuple]] = defaultdict(list)  # wallet -> [(ts_out, dwell_seconds, out_txn)]
+        self._device_users: dict[str, set[str]] = defaultdict(set)
+        self._ring_assoc: set[str] = set()                 # ring wallets + their cash-out agents + shared devices
 
-    def _seed_demo_rings(self) -> None:
-        demo_hub = "019XX-XXX305"
-        demo_rid = "RING-3fa9c1"
-        sp = [f"017XX-XXX{i:03d}" for i in range(101, 115)]
-        all_wallets = [demo_hub] + sp
+    # ------------------------------------------------------------------ construction
+    def _node(self, nid: str, kind: str) -> None:
+        if nid not in self.G:
+            self.G.add_node(nid, kind=kind, label=nid, risk=0.05, total_volume_bdt=0.0, flags=[], ring_id=None)
 
-        if demo_hub not in self.G:
-            self.G.add_node(demo_hub, kind="wallet", label=demo_hub, risk=0.94, total_volume_bdt=71000.0, flags=["Mule ring"])
-        for w in sp:
-            if w not in self.G:
-                self.G.add_node(w, kind="wallet", label=w, risk=0.65, total_volume_bdt=5000.0, flags=["Mule ring"])
-            if not self.G.has_edge(w, demo_hub):
-                self.G.add_edge(w, demo_hub, key=f"{w}-{demo_hub}", kind="transfer", amount_bdt=5000.0, ts="2026-01-26T01:10:00Z", txn_id="TXN-DEMO-RING")
+    def _edge(self, u: str, v: str, kind: str, amt: float, ts: datetime, tid: str) -> None:
+        if self.G.has_edge(u, v, key=kind):
+            d = self.G.edges[u, v, kind]
+            d["amount_bdt"] += amt
+            d["count"] += 1
+            d["last_ts"] = _iso(ts)
+            if len(d["txn_ids"]) < MAX_TXN_IDS:
+                d["txn_ids"].append(tid)
+        else:
+            self.G.add_edge(u, v, key=kind, kind=kind, amount_bdt=amt, count=1,
+                            first_ts=_iso(ts), last_ts=_iso(ts), txn_ids=[tid])
 
-        for a in ("AGT-1190", "AGT-1204"):
-            if a not in self.G:
-                self.G.add_node(a, kind="agent", label=a, risk=0.88, total_volume_bdt=38000.0, flags=["Cashout exit"])
-            if not self.G.has_edge(demo_hub, a):
-                self.G.add_edge(demo_hub, a, key=f"{demo_hub}-{a}", kind="cash_out", amount_bdt=19000.0, ts="2026-01-26T02:44:00Z", txn_id="TXN-DEMO-EXIT")
-
-        for dev in ("DEV-552", "DEV-553"):
-            if dev not in self.G:
-                self.G.add_node(dev, kind="device", label=dev, risk=0.70, total_volume_bdt=0.0, flags=["Shared device"])
-            if not self.G.has_edge(demo_hub, dev):
-                self.G.add_edge(demo_hub, dev, key=f"{demo_hub}-{dev}", kind="uses_device", amount_bdt=0.0, ts="2026-01-26T01:10:00Z", txn_id="TXN-DEV")
-
-        summary = RingSummary(
-            ring_id=demo_rid,
-            wallet_ids=all_wallets,
-            size=len(all_wallets),
-            ring_score=0.94,
-            total_inflow_bdt=71000.0,
-            total_outflow_bdt=38000.0,
-            victim_wallets=14,
-            shared_devices=["DEV-552", "DEV-553"],
-            cashout_agents=["AGT-1190", "AGT-1204"],
-            first_seen="2026-01-26T01:10:00Z",
-            last_seen="2026-01-26T02:44:00Z",
-            flags=["fan_in_hub", "rapid_passthrough", "mule_network"],
-            evidence_ids=[eid_ring(demo_rid), eid_wallet(demo_hub), eid_device("DEV-552")],
-        )
-        self._rings[demo_rid] = summary
-        for w in all_wallets:
-            self._wallet_to_ring[w] = demo_rid
-            self._ring_wallets.add(w)
+    def _add_txn(self, tid: str, ts: datetime, sender: str, ttype: str, amt: float, rcpt: str, device: str | None,
+                 is_fraud: int = 0, scenario: str = "normal") -> None:
+        ttype = ttype.upper()
+        self._node(sender, "wallet")
+        self._node(rcpt, {"CASH_IN": "agent", "CASH_OUT": "agent", "PAYMENT": "merchant"}.get(ttype, "wallet"))
+        self.G.nodes[sender]["total_volume_bdt"] += amt
+        self.G.nodes[rcpt]["total_volume_bdt"] += amt
+        if ttype == "CASH_IN":
+            self._edge(rcpt, sender, "cash_in", amt, ts, tid)           # money flows agent -> wallet
+        else:
+            self._edge(sender, rcpt, "cash_out" if ttype == "CASH_OUT" else "transfer", amt, ts, tid)
+        if device:
+            self._node(device, "device")
+            if not self.G.has_edge(sender, device, key="uses_device"):
+                self.G.add_edge(sender, device, key="uses_device", kind="uses_device", amount_bdt=0.0, count=1,
+                                first_ts=_iso(ts), last_ts=_iso(ts), txn_ids=[tid])
+            self._device_users[device].add(sender)
+        if ttype == "TRANSFER":
+            self._in[rcpt].append((ts, amt, sender, tid))
+        if ttype in ("TRANSFER", "CASH_OUT"):
+            self._out[sender].append((ts, amt, rcpt, tid, ttype))
+        self._txn_lookup[tid] = dict(sender=sender, rcpt=rcpt, amount=amt, ts=ts, type=ttype.lower(),
+                                     device=device, is_fraud=int(is_fraud), scenario=scenario)
 
     def build(self, txns: pd.DataFrame) -> None:
-        """Bulk build graph from transaction DataFrame and detect mule rings."""
-        self.G.clear()
-        self._rings.clear()
-        self._wallet_to_ring.clear()
-        self._ring_wallets.clear()
-        self._txn_lookup.clear()
-        self._txns_df = txns
-
-        if txns.empty:
-            self._seed_demo_rings()
+        """Bulk build from all history. Idempotent; replaces previous state."""
+        self._reset()
+        if txns is None or txns.empty:
             return
-
-        # Ensure ts is sorted
         df = txns.copy()
-        if "ts" in df.columns:
-            df["ts"] = pd.to_datetime(df["ts"])
-            df = df.sort_values("ts")
+        df["ts"] = pd.to_datetime(df["ts"])
+        df = df.sort_values("ts", kind="stable")
+        has_fraud, has_scen = "is_fraud" in df.columns, "scenario" in df.columns
+        for r in df.itertuples(index=False):
+            self._add_txn(
+                str(r.txn_id), r.ts.to_pydatetime(), str(r.user_id), str(r.type), float(r.amount), str(r.recipient_id),
+                str(r.device_id) if pd.notna(r.device_id) else None,
+                int(r.is_fraud) if has_fraud else 0, str(r.scenario) if has_scen else "normal")
+        self._detect_pass_through(df)
+        self._recompute_rings()
 
-        # Track fan-in and fan-out per wallet
-        inflows: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        outflows: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        device_users: dict[str, set[str]] = defaultdict(set)
+    # ------------------------------------------------------------------ mule detection
+    def _detect_pass_through(self, df: pd.DataFrame) -> None:
+        inb = df[df.type == "TRANSFER"][["recipient_id", "ts", "amount"]].rename(
+            columns={"recipient_id": "w", "ts": "ts_in", "amount": "a_in"})
+        out = df[df.type.isin(["TRANSFER", "CASH_OUT"])][["user_id", "ts", "amount", "txn_id"]].rename(
+            columns={"user_id": "w", "ts": "ts_out", "amount": "a_out", "txn_id": "out_txn"})
+        m = out.merge(inb, on="w")
+        m["dwell"] = (m.ts_out - m.ts_in).dt.total_seconds()
+        m = m[(m.dwell > 0) & (m.dwell <= PT_DWELL_S) & (m.a_out >= PT_LO * m.a_in) & (m.a_out <= PT_HI * m.a_in)]
+        # one event per outgoing transaction (keep the quickest matching inbound)
+        m = m.sort_values("dwell").drop_duplicates("out_txn").sort_values("ts_out")
+        for r in m.itertuples(index=False):
+            self._events[r.w].append((r.ts_out.to_pydatetime(), float(r.dwell), r.out_txn))
+        for w, evs in self._events.items():
+            if len(evs) >= PT_MIN_EVENTS:
+                self._wallet_since[w] = evs[PT_MIN_EVENTS - 1][0]
 
-        for _, r in df.iterrows():
-            tid = str(r["txn_id"])
-            ts_str = str(r["ts"])
-            ts_dt = pd.to_datetime(r["ts"]).to_pydatetime()
-            if ts_dt.tzinfo is None:
-                ts_dt = ts_dt.replace(tzinfo=timezone.utc)
-            sender = str(r["user_id"])
-            rcpt = str(r["recipient_id"])
-            amt = float(r["amount"])
-            ttype = str(r["type"]).lower()
-            dev = str(r.get("device_id", ""))
-            agent_id = str(r.get("agent_id", "")) if pd.notna(r.get("agent_id")) else None
+    def _check_pass_through(self, sender: str, ts: datetime, amt: float, tid: str) -> None:
+        """Incremental version for live ingestion."""
+        best = None
+        for t_in, a_in, _src, _tid in self._in.get(sender, ()):
+            dwell = (ts - t_in).total_seconds()
+            if 0 < dwell <= PT_DWELL_S and PT_LO * a_in <= amt <= PT_HI * a_in and (best is None or dwell < best):
+                best = dwell
+        if best is None:
+            return
+        self._events[sender].append((ts, best, tid))
+        if len(self._events[sender]) >= PT_MIN_EVENTS and sender not in self._wallet_since:
+            self._wallet_since[sender] = self._events[sender][PT_MIN_EVENTS - 1][0]
+            self._recompute_rings()
 
-            # Add nodes
-            if sender not in self.G:
-                self.G.add_node(sender, kind="wallet", label=sender, risk=0.05, total_volume_bdt=0.0, flags=[])
-            if rcpt not in self.G:
-                rcpt_kind = "agent" if ttype == "cash_out" or rcpt.startswith("AGT-") else "wallet"
-                self.G.add_node(rcpt, kind=rcpt_kind, label=rcpt, risk=0.05, total_volume_bdt=0.0, flags=[])
+    def _recompute_rings(self) -> None:
+        for nid in list(self._wallet_to_ring) + list(self._ring_assoc):
+            if nid in self.G:
+                nd = self.G.nodes[nid]
+                nd["ring_id"] = None
+                nd["flags"] = [f for f in nd["flags"] if f not in ("Mule ring", "Cashout exit", "Shared device")]
+        self._rings, self._wallet_to_ring, self._ring_assoc = {}, {}, set()
 
-            # Update volume
-            self.G.nodes[sender]["total_volume_bdt"] += amt
-            self.G.nodes[rcpt]["total_volume_bdt"] += amt
+        H = nx.Graph()
+        H.add_nodes_from(self._wallet_since)
+        for u in self._wallet_since:
+            if u in self.G:
+                for _, v, k in self.G.out_edges(u, keys=True):
+                    if k == "transfer" and v in self._wallet_since:
+                        H.add_edge(u, v)
 
-            # Add transaction edge
-            edge_kind = "cash_out" if ttype in ("cash_out", "cashout") else "transfer"
-            self.G.add_edge(sender, rcpt, key=tid, kind=edge_kind, amount_bdt=amt, ts=ts_str, txn_id=tid)
+        for comp in nx.connected_components(H):
+            if len(comp) < 2:
+                continue                                    # a lone suspect is not a ring
+            members = sorted(comp)
+            rid = "RING-" + hashlib.sha1(members[0].encode()).hexdigest()[:6]
+            inflow, victims = 0.0, set()
+            for w in members:
+                for _t, a, src, _ in self._in.get(w, ()):
+                    if src not in comp:
+                        inflow += a
+                        victims.add(src)
+            outflow, agents = 0.0, set()
+            for w in members:
+                for _t, a, dst, _, tp in self._out.get(w, ()):
+                    if tp == "CASH_OUT":
+                        outflow += a
+                        agents.add(dst)
+            shared = sorted({d for d, users in self._device_users.items() if len(users & comp) >= 2})
+            evs = [e for w in members for e in self._events.get(w, ())]
+            firsts = [t for t, _, _ in evs]
+            score = 0.6 + 0.05 * min(len(members), 5) + (0.1 if shared else 0.0) + (0.05 if agents else 0.0)
+            flags = ["mule_network", "rapid_passthrough"]
+            if len(victims) >= 3:
+                flags.append("fan_in_hub")
+            if shared:
+                flags.append("shared_device")
+            if agents:
+                flags.append("cashout_exit")
+            self._rings[rid] = RingSummary(
+                ring_id=rid, wallet_ids=members, size=len(members), ring_score=round(min(0.98, score), 2),
+                total_inflow_bdt=round(inflow, 2), total_outflow_bdt=round(outflow, 2), victim_wallets=len(victims),
+                shared_devices=shared, cashout_agents=sorted(agents), first_seen=_iso(min(firsts)),
+                last_seen=_iso(max(firsts)), flags=flags,
+                evidence_ids=[eid_ring(rid)] + [eid_wallet(w) for w in members[:3]] + [eid_device(d) for d in shared[:3]])
+            for w in members:
+                self._wallet_to_ring[w] = rid
+                nd = self.G.nodes[w]
+                nd.update(ring_id=rid, risk=max(nd["risk"], self._rings[rid].ring_score))
+                nd["flags"].append("Mule ring")
+            self._ring_assoc |= set(members)
+            for a in agents:
+                nd = self.G.nodes[a]
+                nd["risk"] = max(nd["risk"], 0.6)
+                nd["flags"].append("Cashout exit")
+                self._ring_assoc.add(a)
+            for d in shared:
+                nd = self.G.nodes[d]
+                nd["risk"] = max(nd["risk"], 0.5)
+                nd["flags"].append("Shared device")
+                self._ring_assoc.add(d)
+        self._ring_wallets = frozenset(self._wallet_to_ring)
 
-            # Device linkage
-            if dev:
-                if dev not in self.G:
-                    self.G.add_node(dev, kind="device", label=dev, risk=0.05, total_volume_bdt=0.0, flags=[])
-                if not self.G.has_edge(sender, dev):
-                    self.G.add_edge(sender, dev, key=f"{sender}-{dev}", kind="uses_device", amount_bdt=0.0, ts=ts_str, txn_id=tid)
-                device_users[dev].add(sender)
-
-            # Record flows
-            inflows[rcpt].append({"sender": sender, "amount": amt, "ts": ts_dt, "tid": tid, "dev": dev})
-            outflows[sender].append({"recipient": rcpt, "amount": amt, "ts": ts_dt, "tid": tid, "type": ttype, "agent": agent_id})
-
-            self._txn_lookup[tid] = {
-                "sender": sender,
-                "rcpt": rcpt,
-                "amount": amt,
-                "ts": ts_dt,
-                "type": ttype,
-                "device": dev,
-                "is_fraud": int(r.get("is_fraud", 0)),
-                "scenario": str(r.get("scenario", "normal")),
-            }
-
-        # Detect Mule Rings:
-        # Fan-in >= 3 distinct senders into wallet within 90 mins, followed by cash-out or rapid pass-through
-        detected_rings: list[dict[str, Any]] = []
-        for hub, in_list in inflows.items():
-            if len(in_list) < 3:
-                continue
-            distinct_senders = {item["sender"] for item in in_list}
-            if len(distinct_senders) < 3:
-                continue
-
-            total_in = sum(item["amount"] for item in in_list)
-            out_list = outflows.get(hub, [])
-            total_out = sum(item["amount"] for item in out_list)
-
-            # If rapid exit via cash_out or pass-through
-            if total_in > 10000:
-                cashout_agents = list({item["recipient"] for item in out_list if item["type"] in ("cash_out", "cashout") or item["recipient"].startswith("AGT") or item["recipient"].startswith("A")})
-                shared_devs = [d for d, users in device_users.items() if hub in users and len(users) >= 2]
-
-                ring_seed = f"{hub}_{len(distinct_senders)}"
-                r_hash = hashlib.sha256(ring_seed.encode()).hexdigest()[:6]
-                rid = f"RING-{r_hash}"
-
-                wallet_members = list(distinct_senders) + [hub]
-                min_ts = min(item["ts"] for item in in_list).isoformat()
-                max_ts = max(item["ts"] for item in (out_list or in_list)).isoformat()
-
-                summary = RingSummary(
-                    ring_id=rid,
-                    wallet_ids=wallet_members,
-                    size=len(wallet_members),
-                    ring_score=min(0.98, 0.65 + len(distinct_senders) * 0.03),
-                    total_inflow_bdt=total_in,
-                    total_outflow_bdt=total_out,
-                    victim_wallets=len(distinct_senders),
-                    shared_devices=shared_devs,
-                    cashout_agents=cashout_agents,
-                    first_seen=min_ts,
-                    last_seen=max_ts,
-                    flags=["fan_in_hub", "rapid_passthrough", "mule_network"],
-                    evidence_ids=[eid_ring(rid), eid_wallet(hub)] + [eid_device(d) for d in shared_devs],
-                )
-
-                self._rings[rid] = summary
-                for w in wallet_members:
-                    self._wallet_to_ring[w] = rid
-                    self._ring_wallets.add(w)
-                    if w in self.G:
-                        self.G.nodes[w]["ring_id"] = rid
-                        self.G.nodes[w]["risk"] = max(self.G.nodes[w].get("risk", 0.0), summary.ring_score)
-                        self.G.nodes[w]["flags"].append("mule_ring_member")
-
-        # Also register known demo mule hub if present
-        demo_hub = "019XX-XXX305"
-        if demo_hub in self.G and not any(demo_hub in r.wallet_ids for r in self._rings.values()):
-            demo_rid = "RING-3fa9c1"
-            sp = [f"017XX-XXX{i:03d}" for i in range(101, 115)]
-            summary = RingSummary(
-                ring_id=demo_rid,
-                wallet_ids=[demo_hub] + sp,
-                size=15,
-                ring_score=0.94,
-                total_inflow_bdt=71000.0,
-                total_outflow_bdt=38000.0,
-                victim_wallets=14,
-                shared_devices=["DEV-552", "DEV-553"],
-                cashout_agents=["AGT-1190", "AGT-1204"],
-                first_seen="2026-01-26T01:10:00Z",
-                last_seen="2026-01-26T02:44:00Z",
-                flags=["fan_in_hub", "rapid_passthrough", "mule_network"],
-                evidence_ids=[eid_ring(demo_rid), eid_wallet(demo_hub), eid_device("DEV-552")],
-            )
-            self._rings[demo_rid] = summary
-            for w in summary.wallet_ids:
-                self._wallet_to_ring[w] = demo_rid
-                self._ring_wallets.add(w)
-
+    # ------------------------------------------------------------------ live ingestion
     def ingest(self, txn: Transaction) -> None:
-        """Incrementally add a live transaction into the graph."""
         tid = txn.txn_id or f"LIVE-{int(time.time() * 1000)}"
-        ts_str = txn.ts.isoformat()
-        amt = float(txn.amount)
-
-        if txn.user_id not in self.G:
-            self.G.add_node(txn.user_id, kind="wallet", label=txn.user_id, risk=0.1, total_volume_bdt=0.0, flags=[])
-        if txn.recipient_id not in self.G:
-            kind = "agent" if txn.type == "CASH_OUT" else "wallet"
-            self.G.add_node(txn.recipient_id, kind=kind, label=txn.recipient_id, risk=0.1, total_volume_bdt=0.0, flags=[])
-
-        self.G.nodes[txn.user_id]["total_volume_bdt"] += amt
-        self.G.nodes[txn.recipient_id]["total_volume_bdt"] += amt
-
-        edge_kind = "cash_out" if txn.type == "CASH_OUT" else "transfer"
-        self.G.add_edge(txn.user_id, txn.recipient_id, key=tid, kind=edge_kind, amount_bdt=amt, ts=ts_str, txn_id=tid)
-
-        if txn.device_id:
-            if txn.device_id not in self.G:
-                self.G.add_node(txn.device_id, kind="device", label=txn.device_id, risk=0.05, total_volume_bdt=0.0, flags=[])
-            if not self.G.has_edge(txn.user_id, txn.device_id):
-                self.G.add_edge(txn.user_id, txn.device_id, key=f"{txn.user_id}-{txn.device_id}", kind="uses_device", amount_bdt=0.0, ts=ts_str, txn_id=tid)
+        ts = _naive(txn.ts)
+        self._add_txn(tid, ts, txn.user_id, txn.type, float(txn.amount), txn.recipient_id, txn.device_id)
+        if txn.type in ("TRANSFER", "CASH_OUT"):
+            self._check_pass_through(txn.user_id, ts, float(txn.amount), tid)
 
     def attach_scores(self, risk_by_txn: Mapping[str, float]) -> None:
-        """Attaches maximum ML risk score to associated graph nodes."""
-        for tid, rscore in risk_by_txn.items():
-            if tid in self._txn_lookup:
-                sender = self._txn_lookup[tid]["sender"]
-                rcpt = self._txn_lookup[tid]["rcpt"]
-                if sender in self.G:
-                    self.G.nodes[sender]["risk"] = max(self.G.nodes[sender].get("risk", 0.0), float(rscore))
-                if rcpt in self.G:
-                    self.G.nodes[rcpt]["risk"] = max(self.G.nodes[rcpt].get("risk", 0.0), float(rscore) * 0.8)
+        """Nodes carry the maximum ML risk of the transactions they take part in (recipients at 80%)."""
+        for tid, score in risk_by_txn.items():
+            meta = self._txn_lookup.get(tid)
+            if not meta:
+                continue
+            s, r = float(score), float(score) * 0.8
+            for nid, val in ((meta["sender"], s), (meta["rcpt"], r)):
+                if nid in self.G:
+                    self.G.nodes[nid]["risk"] = max(self.G.nodes[nid]["risk"], min(0.99, val))
 
+    # ------------------------------------------------------------------ signals
     def signals(self, txn_id: str) -> GraphSignals:
-        """Evidence for the sender of txn_id as of that transaction."""
         meta = self._txn_lookup.get(txn_id)
         if not meta:
             return GraphSignals(wallet_id="unknown")
         return self.wallet_signals(meta["sender"], as_of=meta["ts"])
 
     def wallet_signals(self, wallet_id: str, as_of: datetime | None = None) -> GraphSignals:
-        """Point-in-time signals for a given wallet."""
+        asof = _naive(as_of)
         if wallet_id not in self.G:
-            return GraphSignals(wallet_id=wallet_id, as_of=as_of)
+            return GraphSignals(wallet_id=wallet_id, as_of=asof)
 
-        fan_in = self.G.in_degree(wallet_id)
-        fan_out = self.G.out_degree(wallet_id)
+        def upto(rows):
+            return [x for x in rows if asof is None or x[0] <= asof]
 
-        in_vol = sum(data.get("amount_bdt", 0.0) for _, _, data in self.G.in_edges(wallet_id, data=True) if data.get("kind") != "uses_device")
-        out_vol = sum(data.get("amount_bdt", 0.0) for _, _, data in self.G.out_edges(wallet_id, data=True) if data.get("kind") != "uses_device")
+        ins, outs = upto(self._in.get(wallet_id, ())), upto(self._out.get(wallet_id, ()))
+        fan_in, fan_out = len({x[2] for x in ins}), len({x[2] for x in outs})
+        in_vol, out_vol = sum(x[1] for x in ins), sum(x[1] for x in outs)
+        passthrough = min(2.0, out_vol / in_vol) if in_vol > 0 else 0.0
+        events = upto(self._events.get(wallet_id, ()))
+        dwell = statistics.median([e[1] for e in events]) if events else None
 
-        passthrough = (out_vol / in_vol) if in_vol > 0 else 0.0
-        ring_id = self._wallet_to_ring.get(wallet_id)
-        ring_score = self._rings[ring_id].ring_score if ring_id and ring_id in self._rings else 0.0
+        rid = self._wallet_to_ring.get(wallet_id)
+        if rid and asof is not None and asof < self._wallet_since.get(wallet_id, asof):
+            rid = None                                          # not yet detectable at that time
+        shared = max((len(self._device_users[d]) for d in self.G.successors(wallet_id)
+                      if self.G.nodes[d].get("kind") == "device"), default=0)
 
-        flags: list[str] = []
-        evidence_ids = [eid_wallet(wallet_id)]
-
-        if fan_in >= 3:
+        flags, evidence = [], [eid_wallet(wallet_id)]
+        if fan_in >= 5 and passthrough >= 0.5:
             flags.append("fan_in_hub")
-        if passthrough >= 0.7:
+        if events:
             flags.append("rapid_passthrough")
-        if ring_id:
+        if shared >= 3:
+            flags.append("shared_device")
+        if rid:
             flags.append("ring_member")
-            evidence_ids.append(eid_ring(ring_id))
-
+            evidence.append(eid_ring(rid))
         return GraphSignals(
-            wallet_id=wallet_id,
-            as_of=as_of,
-            ring_id=ring_id,
-            ring_score=ring_score,
-            fan_in=int(fan_in),
-            fan_out=int(fan_out),
-            passthrough_ratio=min(2.0, round(passthrough, 2)),
-            flags=flags,
-            evidence_ids=evidence_ids,
-        )
+            wallet_id=wallet_id, as_of=asof, ring_id=rid, ring_score=self._rings[rid].ring_score if rid else 0.0,
+            fan_in=fan_in, fan_out=fan_out, passthrough_ratio=round(passthrough, 2), median_dwell_seconds=dwell,
+            shared_device_accounts=shared, flags=flags, evidence_ids=evidence)
+
+    # ------------------------------------------------------------------ views
+    def default_center(self) -> str | None:
+        """Most interesting entry point: the busiest ring wallet, else the riskiest / busiest wallet."""
+        if self._rings:
+            top = max(self._rings.values(), key=lambda r: r.total_inflow_bdt)
+            return max(top.wallet_ids, key=lambda w: self.G.nodes[w]["total_volume_bdt"])
+        wallets = [n for n, d in self.G.nodes(data=True) if d["kind"] == "wallet"]
+        return max(wallets, key=lambda n: (self.G.nodes[n]["risk"], self.G.nodes[n]["total_volume_bdt"]), default=None)
+
+    def _neighbours(self, node: str) -> list[str]:
+        vol: dict[str, float] = defaultdict(float)
+        for _, v, d in self.G.out_edges(node, data=True):
+            vol[v] += d["amount_bdt"] + 1
+        for u, _, d in self.G.in_edges(node, data=True):
+            vol[u] += d["amount_bdt"] + 1
+        return [n for n, _ in sorted(vol.items(), key=lambda kv: -kv[1])[:NEIGHBOUR_CAP]]
 
     def view(self, center: str, depth: int = 2, max_nodes: int = 120, as_of: datetime | None = None) -> GraphView:
-        """Extract ego neighborhood up to depth hops formatted for GraphView."""
         if center not in self.G:
             return GraphView(center=center, nodes=[], edges=[], truncated=False)
-
-        # BFS to depth
-        visited: set[str] = {center}
-        frontier: set[str] = {center}
-
+        visited, frontier, truncated = {center}, [center], False
         for _ in range(depth):
-            next_frontier: set[str] = set()
+            nxt: list[str] = []
             for node in frontier:
-                neighbors = set(self.G.successors(node)) | set(self.G.predecessors(node))
-                for n in neighbors:
-                    if n not in visited:
-                        visited.add(n)
-                        next_frontier.add(n)
+                for n in self._neighbours(node):
+                    if n in visited:
+                        continue
                     if len(visited) >= max_nodes:
+                        truncated = True
                         break
-                if len(visited) >= max_nodes:
-                    break
-            frontier = next_frontier
-            if len(visited) >= max_nodes:
-                break
-
-        sub = self.G.subgraph(visited)
-
-        nodes: list[GraphNode] = []
-        for n, data in sub.nodes(data=True):
-            kind = data.get("kind", "wallet")
+                    visited.add(n)
+                    nxt.append(n)
+            frontier = nxt
+        nodes = []
+        for n in visited:
+            d = self.G.nodes[n]
+            kind = d["kind"]
             eid = eid_agent(n) if kind == "agent" else eid_device(n) if kind == "device" else eid_wallet(n)
-            nodes.append(
-                GraphNode(
-                    id=n,
-                    kind=kind,
-                    label=data.get("label", n),
-                    risk=float(data.get("risk", 0.05)),
-                    ring_id=data.get("ring_id"),
-                    flags=data.get("flags", []),
-                    evidence_id=eid,
-                )
-            )
-
-        edges: list[GraphEdge] = []
-        for u, v, k, data in sub.edges(keys=True, data=True):
-            edges.append(
-                GraphEdge(
-                    source=u,
-                    target=v,
-                    kind=data.get("kind", "transfer"),
-                    amount_bdt=float(data.get("amount_bdt", 0.0)),
-                    count=1,
-                    first_ts=data.get("ts"),
-                    last_ts=data.get("ts"),
-                    txn_ids=[str(data.get("txn_id"))] if "txn_id" in data else [],
-                )
-            )
-
-        return GraphView(
-            center=center,
-            as_of=as_of,
-            nodes=nodes,
-            edges=edges,
-            truncated=len(visited) >= max_nodes,
-            stats={"node_count": len(nodes), "edge_count": len(edges)},
-        )
+            nodes.append(GraphNode(id=n, kind=kind, label=d["label"], risk=min(1.0, float(d["risk"])),
+                                   ring_id=d.get("ring_id"), flags=list(d["flags"]), evidence_id=eid))
+        edges = [GraphEdge(source=u, target=v, kind=d["kind"], amount_bdt=round(float(d["amount_bdt"]), 2),
+                           count=int(d["count"]), first_ts=d["first_ts"], last_ts=d["last_ts"], txn_ids=list(d["txn_ids"]))
+                 for u, v, _k, d in self.G.subgraph(visited).edges(keys=True, data=True)]
+        return GraphView(center=center, as_of=_naive(as_of), nodes=nodes, edges=edges, truncated=truncated,
+                         stats={"node_count": len(nodes), "edge_count": len(edges)})
 
     def frontend_view(self, center: str | None = None, depth: int = 2) -> dict[str, Any]:
-        """Returns JSON strictly formatted for vis-network in Frontend/assets/js/api.js."""
-        if not center or center not in self.G:
-            # Return demo ring network or top high-risk hub
-            hub = "019XX-XXX305" if "019XX-XXX305" in self.G else (list(self.G.nodes())[0] if self.G.nodes() else "019XX-XXX305")
-            center = hub
-
+        """JSON for the vis-network dashboard (shape documented in Frontend/assets/js/data.js)."""
+        if not center:
+            center = self.default_center()
+        if center is None or center not in self.G:                      # unknown entity -> empty graph, never a silent fallback
+            return {"center": None, "nodes": [], "edges": []}
         gv = self.view(center=center, depth=depth, max_nodes=100)
-        f_nodes = []
-        for n in gv.nodes:
-            is_ring = bool(n.ring_id or "mule" in str(n.flags).lower())
-            f_nodes.append({
-                "id": n.id,
-                "type": n.kind,
-                "label": n.label,
-                "risk_score": round(n.risk, 2),
-                "total_volume_bdt": self.G.nodes[n.id].get("total_volume_bdt", 0.0),
-                "flags": ["Mule ring"] if is_ring else n.flags,
-                "ring": is_ring,
-            })
-
-        f_edges = []
-        for e in gv.edges:
-            f_edges.append({
-                "source": e.source,
-                "target": e.target,
-                "amount_bdt": e.amount_bdt,
-                "count": e.count,
-                "last_seen": e.last_ts or "today",
-            })
-
-        return {"nodes": f_nodes, "edges": f_edges}
+        nodes = [{"id": n.id, "type": n.kind, "label": n.label, "risk_score": round(n.risk, 2),
+                  "total_volume_bdt": round(float(self.G.nodes[n.id]["total_volume_bdt"]), 2),
+                  "flags": n.flags, "ring": n.id in self._ring_assoc} for n in gv.nodes]
+        edges = [{"source": e.source, "target": e.target, "amount_bdt": e.amount_bdt, "count": e.count,
+                  "last_seen": e.last_ts or "today"} for e in gv.edges]
+        return {"center": center, "nodes": nodes, "edges": edges}
 
     def rings(self, min_score: float = 0.5, as_of: datetime | None = None) -> list[RingSummary]:
-        return [r for r in self._rings.values() if r.ring_score >= min_score]
+        asof = _naive(as_of)
+        rows = [r for r in self._rings.values() if r.ring_score >= min_score
+                and (asof is None or datetime.fromisoformat(r.first_seen) <= asof)]
+        return sorted(rows, key=lambda r: -r.total_inflow_bdt)
 
     def ring(self, ring_id: str) -> RingSummary:
         if ring_id not in self._rings:
@@ -423,59 +366,37 @@ class NetworkXGraphService(GraphService):
         return self._rings[ring_id]
 
     def ring_wallets(self) -> frozenset[str]:
-        return frozenset(self._ring_wallets)
+        return self._ring_wallets
 
+    # ------------------------------------------------------------------ what-if
     def simulate_freeze(self, wallet_ids: list[str], freeze_at: datetime | None = None) -> FreezeImpact:
-        """Simulate the financial and operational impact of freezing target wallets."""
-        freeze_dt = freeze_at or datetime.now(timezone.utc)
-        frozen_set = set(wallet_ids)
-
-        blocked_count = 0
-        blocked_value = 0.0
-        fraud_stopped = 0.0
-        legit_blocked = 0.0
-        cashouts_prevented = 0
-        downstream_wallets: set[str] = set()
-
-        for tid, meta in self._txn_lookup.items():
-            sender = meta["sender"]
-            rcpt = meta["rcpt"]
-            amt = meta["amount"]
-            is_fraud = meta["is_fraud"]
-            ttype = meta["type"]
-
-            if sender in frozen_set:
-                blocked_count += 1
-                blocked_value += amt
-                downstream_wallets.add(rcpt)
-                if is_fraud == 1:
-                    fraud_stopped += amt
-                else:
-                    legit_blocked += amt
-
-                if ttype in ("cash_out", "cashout"):
-                    cashouts_prevented += 1
-
-        # If data is synthetic and no labels matched, provide realistic estimate
-        if blocked_value == 0:
-            for wid in wallet_ids:
-                if wid in self.G:
-                    vol = self.G.nodes[wid].get("total_volume_bdt", 38000.0)
-                    blocked_value += vol
-                    fraud_stopped += vol * 0.95
-                    legit_blocked += vol * 0.05
-                    blocked_count += 6
-                    cashouts_prevented += 1
-                    downstream_wallets.add("AGT-1190")
-
+        """What if these wallets had been frozen? Counts every transaction they sent or received afterwards.
+        Uses the dataset's fraud labels (evaluation only, `labels_used=True`)."""
+        frozen = set(wallet_ids)
+        when = _naive(freeze_at)
+        if when is None:
+            ring_starts = [datetime.fromisoformat(self._rings[self._wallet_to_ring[w]].first_seen)
+                           for w in frozen if w in self._wallet_to_ring]
+            when = (min(ring_starts) + timedelta(minutes=30)) if ring_starts else datetime.min
+        n = cashouts = 0
+        blocked = fraud = legit = 0.0
+        downstream: set[str] = set()
+        for meta in self._txn_lookup.values():
+            if meta["ts"] < when or not (meta["sender"] in frozen or meta["rcpt"] in frozen):
+                continue
+            n += 1
+            blocked += meta["amount"]
+            if meta["is_fraud"]:
+                fraud += meta["amount"]
+            else:
+                legit += meta["amount"]
+            if meta["type"] == "cash_out":
+                cashouts += 1
+            if meta["sender"] in frozen and meta["rcpt"] not in frozen:
+                downstream.add(meta["rcpt"])
         return FreezeImpact(
-            frozen_wallets=wallet_ids,
-            freeze_at=freeze_dt,
-            blocked_txn_count=blocked_count or 14,
-            blocked_value_bdt=round(blocked_value or 38000.0, 2),
-            fraud_value_stopped_bdt=round(fraud_stopped or 36100.0, 2),
-            legit_value_blocked_bdt=round(legit_blocked or 1900.0, 2),
-            cashouts_prevented=cashouts_prevented or 2,
-            downstream_wallets_cut_off=len(downstream_wallets) or 3,
-            labels_used=True,
-        )
+            frozen_wallets=wallet_ids, freeze_at=when.replace(tzinfo=timezone.utc) if when != datetime.min
+            else datetime(2000, 1, 1, tzinfo=timezone.utc),
+            blocked_txn_count=n, blocked_value_bdt=round(blocked, 2), fraud_value_stopped_bdt=round(fraud, 2),
+            legit_value_blocked_bdt=round(legit, 2), cashouts_prevented=cashouts,
+            downstream_wallets_cut_off=len(downstream), labels_used=True)

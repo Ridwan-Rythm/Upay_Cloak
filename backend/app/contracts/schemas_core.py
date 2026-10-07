@@ -48,6 +48,7 @@ class ScoreResponse(_M):
     scored: ScoredTransaction
     latency_ms: float
     feature_mode: Literal["replay", "live"]
+    warnings: list[str] = []         # e.g. "no behavioural baseline for this wallet (cold start)"
 
 
 # ---------------------------------------------------------------- customer warning (pre-send nudge)
@@ -59,6 +60,7 @@ class WarningRequest(_M):
     language: Language = "en"
     device_id: str | None = None
     location: str | None = None
+    merchant_category: str | None = None     # what the money is for, if the app knows (e.g. "gambling")
 
 
 class WarningResult(_M):

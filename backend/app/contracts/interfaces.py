@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 import pandas as pd
 
@@ -123,3 +123,4 @@ class Container:
     """Wired at startup by Part 1 (backend/app/main.py) and injected with `Depends(get_container)`."""
     cases: CaseProvider
     intel: IntelligenceServices
+    scoring: Any = None               # backend.app.services.scoring_service.ScoringService (None = ML not loaded)

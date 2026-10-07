@@ -12,6 +12,6 @@ function layout(active){
  const gs=document.getElementById('gs');
  gs.onkeydown=e=>{if(e.key==='Enter'){const v=e.target.value.trim();location.href=/^CASE/i.test(v)?'case.html?id='+v.toUpperCase():'graph.html?q='+encodeURIComponent(v)}};
  addEventListener('keydown',e=>{if(e.key==='/'&&!/INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName)){e.preventDefault();gs.focus()}});
- api.getCases().then(c=>{const n=c.filter(x=>x.severity==='critical'||x.severity==='high').length,e=document.getElementById('cc');if(e&&n){e.textContent=n;e.hidden=false}});
+ api.getCaseCount().then(r=>{const n=r.high_or_critical,e=document.getElementById('cc');if(e&&n){e.textContent=n;e.hidden=false}}).catch(()=>{});
 }
 function toast(m){const t=document.createElement('div');t.className='toast';t.textContent=m;document.body.appendChild(t);setTimeout(()=>t.remove(),2600)}

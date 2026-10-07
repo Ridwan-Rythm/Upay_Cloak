@@ -1,196 +1,171 @@
-"""Grounded AI Investigation Assistant for UpayShield.
-Implements the InvestigationAssistant protocol with dual-mode execution:
-1. Live LLM (Gemini / OpenAI / Anthropic) grounded in structured EvidenceBundle.
-2. Infallible, deterministic template fallback that cites valid evidence IDs with zero latency.
+"""Grounded investigation assistant.
+
+Two modes, same output contract:
+  1. LLM (Gemini / Anthropic / OpenAI, chosen by UPAY_LLM_PROVIDER). The model is shown ONLY the evidence items and must
+     cite their ids. Every sentence is validated: unknown or missing citations -> the whole answer is rejected.
+  2. Deterministic template (default, zero latency, always valid): composes sentences straight from the evidence.
+The LLM path never raises: any failure falls back to the template and records `fallback_reason`.
 """
 from __future__ import annotations
 
-import os
-import re
-from typing import Any
+import json
+import logging
+import urllib.error
+import urllib.request
 
 from backend.app.config import get_settings
 from backend.app.contracts.evidence_ids import extract_ids
 from backend.app.contracts.interfaces import InvestigationAssistant
-from backend.app.contracts.schemas import Action, Language
-from backend.app.contracts.schemas_intel import (
-    Answer,
-    EvidenceBundle,
-    Narrative,
-    NarrativeSentence,
-)
+from backend.app.contracts.schemas import Language
+from backend.app.contracts.schemas_intel import Answer, EvidenceBundle, EvidenceItem, Narrative, NarrativeSentence
+
+log = logging.getLogger("upayshield.assistant")
+
+DEFAULT_MODELS = {"gemini": "gemini-2.0-flash", "anthropic": "claude-haiku-4-5-20251001", "openai": "gpt-4o-mini"}
+
+ACTION_TEXT = {
+    "en": {"allow": "allow the transaction", "otp_step_up": "ask the customer for step-up verification",
+           "hold": "hold the transaction for analyst review", "escalate": "escalate to a senior analyst",
+           "block": "block the transaction and contact the customer", "freeze_wallet": "freeze the wallet and escalate the network"},
+    "bn": {"allow": "লেনদেনটি অনুমোদন করুন", "otp_step_up": "গ্রাহকের কাছ থেকে অতিরিক্ত যাচাই নিন",
+           "hold": "বিশ্লেষকের পর্যালোচনার জন্য লেনদেনটি স্থগিত রাখুন", "escalate": "জ্যেষ্ঠ বিশ্লেষকের কাছে পাঠান",
+           "block": "লেনদেনটি বন্ধ করুন এবং গ্রাহকের সাথে যোগাযোগ করুন", "freeze_wallet": "ওয়ালেট ফ্রিজ করুন এবং নেটওয়ার্কটি এস্কেলেট করুন"},
+}
+T = {
+    "en": {"happened": "{label}.", "why": "It was flagged because: {reasons}.", "why_none": "The risk engine found behaviour that deviates from the norm.",
+           "next": "Recommended action: {action}.", "purpose": "The money is being used for: {purpose}.",
+           "ring": "The wallet belongs to a detected mule ring.", "unknown": "The evidence does not say.",
+           "summary": "Case {case}: recommended action is to {action}."},
+    "bn": {"happened": "{label}।", "why": "এটি চিহ্নিত হয়েছে কারণ: {reasons}।", "why_none": "ঝুঁকি ইঞ্জিন স্বাভাবিকের চেয়ে ভিন্ন আচরণ পেয়েছে।",
+           "next": "প্রস্তাবিত পদক্ষেপ: {action}।", "purpose": "টাকাটি ব্যবহার হচ্ছে: {purpose}।",
+           "ring": "ওয়ালেটটি একটি শনাক্তকৃত মিউল রিংয়ের অংশ।", "unknown": "প্রমাণে এ বিষয়ে কিছু বলা নেই।",
+           "summary": "কেস {case}: প্রস্তাবিত পদক্ষেপ হলো {action}।"},
+}
+
+
+def _by_kind(bundle: EvidenceBundle, ids: list[str], *kinds: str) -> list[EvidenceItem]:
+    idx = bundle.index()
+    return [idx[i] for i in ids if i in idx and idx[i].kind.value in kinds]
 
 
 class GroundedInvestigationAssistant(InvestigationAssistant):
     def __init__(self) -> None:
         self.settings = get_settings()
 
+    # ------------------------------------------------------------------ template composition
+    def _facts(self, bundle: EvidenceBundle, lang: str):
+        t = T[lang]
+        what = _by_kind(bundle, bundle.what_happened, "TXN")
+        happened = [NarrativeSentence(text=t["happened"].format(label=what[0].label), evidence_ids=[what[0].id])] if what else []
+        if what and what[0].facts.get("purpose"):
+            happened.append(NarrativeSentence(
+                text=t["purpose"].format(purpose=str(what[0].facts["purpose"]).replace("_", " ")), evidence_ids=[what[0].id]))
+        if not happened:
+            happened = [NarrativeSentence(text=t["happened"].format(label=f"Case {bundle.case_id}"), evidence_ids=bundle.what_happened[:1] or list(bundle.ids())[:1])]
+        reasons = _by_kind(bundle, bundle.why_risky, "RULE", "FACTOR", "RING")
+        why = []
+        if reasons:
+            top = reasons[:4]
+            why.append(NarrativeSentence(text=t["why"].format(reasons="; ".join(r.label for r in top)), evidence_ids=[r.id for r in top]))
+        else:
+            why.append(NarrativeSentence(text=t["why_none"], evidence_ids=bundle.why_risky[:1] or list(bundle.ids())[:1]))
+        pol = bundle.what_next[:1] or list(bundle.ids())[:1]
+        nxt = [NarrativeSentence(text=t["next"].format(action=ACTION_TEXT[lang][bundle.recommended_action.value]), evidence_ids=pol)]
+        return happened, why, nxt
+
     def narrate(self, bundle: EvidenceBundle, language: Language = "en", force_template: bool = False) -> Narrative:
-        """Produce a grounded 3-part narrative (What happened, Why risky, What next)."""
-        idx = bundle.index()
-        all_ids = bundle.ids()
+        happened, why, nxt = self._facts(bundle, language)
+        return Narrative(case_id=bundle.case_id, language=language, source="template", validated=True,
+                         what_happened=happened, why_risky=why, what_next=nxt, recommended_action=bundle.recommended_action)
 
-        # If live LLM is configured and not forced to template, we could call LLM here.
-        # Fallback template guarantees 100% reliability and contract adherence.
-        wh_sentences: list[NarrativeSentence] = []
-        wr_sentences: list[NarrativeSentence] = []
-        wn_sentences: list[NarrativeSentence] = []
-
-        # 1. What happened
-        wh_ids = bundle.what_happened or list(all_ids)[:2]
-        wh_text = "The transaction was executed "
-        if bundle.timeline:
-            ev = bundle.timeline[0]
-            wh_text = f"At {ev.ts}, a {ev.label} was recorded."
-        else:
-            wh_text = f"Transaction was initiated with evidence {', '.join(wh_ids)}."
-        wh_sentences.append(NarrativeSentence(text=wh_text, evidence_ids=wh_ids))
-
-        # 2. Why risky
-        wr_ids = bundle.why_risky or list(all_ids)[:2]
-        rule_items = [idx[i] for i in wr_ids if i in idx and idx[i].kind.value in ("RULE", "FACTOR", "RING")]
-        if rule_items:
-            reasons_str = "; ".join([r.label for r in rule_items[:3]])
-            wr_text = f"Flagged as high-risk due to: {reasons_str}."
-        else:
-            wr_text = f"Risk engine detected behavioral deviations supporting review."
-        wr_sentences.append(NarrativeSentence(text=wr_text, evidence_ids=wr_ids))
-
-        # 3. What next
-        wn_ids = bundle.what_next or list(all_ids)[:1]
-        wn_text = f"Recommended immediate action is {bundle.recommended_action.value.upper()} to limit financial exposure while verification proceeds."
-        wn_sentences.append(NarrativeSentence(text=wn_text, evidence_ids=wn_ids))
-
-        return Narrative(
-            case_id=bundle.case_id,
-            language=language,
-            source="template",
-            validated=True,
-            what_happened=wh_sentences,
-            why_risky=wr_sentences,
-            what_next=wn_sentences,
-            recommended_action=bundle.recommended_action,
-        )
-
+    # ------------------------------------------------------------------ Q&A
     def ask(self, bundle: EvidenceBundle, question: str, language: Language = "en") -> Answer:
-        """Answer an analyst question grounded strictly in EvidenceBundle facts."""
-        q_lower = question.lower()
+        fallback_reason = None
+        if self.settings.llm_provider != "none" and self.settings.llm_api_key:
+            ans, fallback_reason = self._ask_llm(bundle, question, language)
+            if ans:
+                return ans
+        ans = self._ask_template(bundle, question, language)
+        ans.fallback_reason = fallback_reason
+        return ans
+
+    def _ask_template(self, bundle: EvidenceBundle, question: str, lang: str) -> Answer:
+        q, t = question.lower(), T[lang]
+        happened, why, nxt = self._facts(bundle, lang)
         idx = bundle.index()
-        all_ids = list(bundle.ids())
-
-        # Check for Gemini API key
-        gemini_key = os.environ.get("GEMINI_API_KEY") or self.settings.llm_api_key
-        if gemini_key and not self.settings.llm_provider == "none":
-            try:
-                ans = self._call_llm(bundle, question, language, gemini_key)
-                if ans:
-                    return ans
-            except Exception as e:
-                print(f"LLM call failed, falling back to deterministic template: {e}")
-
-        # Deterministic Template Fallback (100% Reliable & Fast)
-        wh_ids = bundle.what_happened or all_ids[:2]
-        wr_ids = bundle.why_risky or all_ids[:2]
-        wn_ids = bundle.what_next or all_ids[:1]
-
-        if any(w in q_lower for w in ("why", "flag", "risk", "reason", "score")):
-            reasons = [idx[i].label for i in wr_ids if i in idx][:3]
-            reason_text = ", ".join(reasons) if reasons else "anomalous transaction velocity and pattern deviation"
-            sentences = [
-                NarrativeSentence(
-                    text=f"This case was flagged primarily due to {reason_text}.",
-                    evidence_ids=wr_ids,
-                ),
-                NarrativeSentence(
-                    text=f"The blended risk assessment recommended {bundle.recommended_action.value.upper()} to prevent unauthorized loss.",
-                    evidence_ids=wn_ids,
-                ),
-            ]
-            return Answer(case_id=bundle.case_id, question=question, language=language, source="template", validated=True, sentences=sentences)
-
-        elif any(w in q_lower for w in ("who", "connect", "link", "network", "wallet", "ring")):
-            wallets = [idx[i].facts.get("wallet_id") or idx[i].facts.get("recipient_id") for i in all_ids if i in idx and "wallet" in idx[i].kind.value.lower()]
-            wallets = [str(w) for w in wallets if w]
-            w_str = ", ".join(wallets[:3]) if wallets else "linked counter-parties"
-            sentences = [
-                NarrativeSentence(
-                    text=f"The entity connects directly to {w_str} across the transaction timeline.",
-                    evidence_ids=wh_ids,
-                )
-            ]
-            return Answer(case_id=bundle.case_id, question=question, language=language, source="template", validated=True, sentences=sentences)
-
-        elif any(w in q_lower for w in ("summar", "compliance", "report", "overview")):
-            sentences = [
-                NarrativeSentence(
-                    text=f"Compliance Summary: Case {bundle.case_id} involves an alert with recommended action {bundle.recommended_action.value.upper()}.",
-                    evidence_ids=wn_ids,
-                ),
-                NarrativeSentence(
-                    text=f"The primary event timeline was triggered under {', '.join(wh_ids[:2])} with corroborated risk factors {', '.join(wr_ids[:2])}.",
-                    evidence_ids=wh_ids + wr_ids,
-                ),
-            ]
-            return Answer(case_id=bundle.case_id, question=question, language=language, source="template", validated=True, sentences=sentences)
-
+        sentences: list[NarrativeSentence]
+        if any(w in q for w in ("purpose", "use the money", "spend", "bet", "gambl", "what for", "what is the money")):
+            sentences = [s for s in happened if "money" in s.text.lower() or "টাকা" in s.text] or happened
+        elif any(w in q for w in ("otp", "session", "sim", "password", "pin", "breach")):
+            items = [i for i in idx.values() if i.kind.value in ("RULE", "FACTOR") and
+                     any(k in (i.id + i.label).lower() for k in ("otp", "sim", "session"))]
+            sentences = [NarrativeSentence(text=i.label + ".", evidence_ids=[i.id]) for i in items[:4]] or \
+                [NarrativeSentence(text=t["unknown"], evidence_ids=list(bundle.ids())[:1])]
+        elif any(w in q for w in ("who", "connect", "link", "network", "ring", "wallet")):
+            w = [i for i in idx.values() if i.kind.value in ("WALLET", "RING", "DEVICE", "AGENT")]
+            sentences = [NarrativeSentence(text=("; ".join(i.label for i in w[:5]) + "."), evidence_ids=[i.id for i in w[:5]])] if w else \
+                [NarrativeSentence(text=t["unknown"], evidence_ids=list(bundle.ids())[:1])]
+        elif any(w in q for w in ("summar", "compliance", "report", "overview")):
+            sentences = happened + why + nxt
+        elif any(w in q for w in ("why", "flag", "risk", "reason", "score", "suspicio")):
+            sentences = why + nxt
+        elif any(w in q for w in ("next", "do", "action", "recommend", "should")):
+            sentences = nxt
         else:
-            # General answer
-            sentences = [
-                NarrativeSentence(
-                    text=f"Evidence records {len(bundle.items)} verified data points for Case {bundle.case_id}, indicating action {bundle.recommended_action.value.upper()}.",
-                    evidence_ids=all_ids[:2] or ["METRIC-risk_score"],
-                )
-            ]
-            return Answer(case_id=bundle.case_id, question=question, language=language, source="template", validated=True, sentences=sentences)
+            sentences = happened + why
+        return Answer(case_id=bundle.case_id, question=question, language=lang, source="template", validated=True,
+                      answerable=not any(s.text == t["unknown"] for s in sentences), sentences=sentences)
 
-    def _call_llm(self, bundle: EvidenceBundle, question: str, language: Language, api_key: str) -> Answer | None:
-        """Call Gemini API with structured prompt and strict evidence grounding."""
+    # ------------------------------------------------------------------ LLM path (validated, never raises)
+    def _ask_llm(self, bundle: EvidenceBundle, question: str, lang: str) -> tuple[Answer | None, str | None]:
+        facts = [{"id": i.id, "kind": i.kind.value, "label": i.label, "facts": i.facts} for i in bundle.items]
+        prompt = (
+            "You are the fraud-investigation assistant of a mobile-money platform.\n"
+            "Answer ONLY from the evidence items below. Put the evidence id(s) in square brackets after EVERY sentence, "
+            "e.g. [TXN-0001234]. If the evidence does not contain the answer, say so. Never invent numbers.\n"
+            f"Write one short sentence per line, in language code '{lang}'.\n\nQuestion: {question}\n\n"
+            f"Evidence (JSON):\n{json.dumps(facts, ensure_ascii=False)}")
         try:
-            import urllib.request
-            import json
+            text = self._complete(prompt)
+        except Exception as e:                                                      # noqa: BLE001
+            log.warning("LLM call failed, using template: %s", e)
+            return None, f"llm_error: {type(e).__name__}"
+        valid_ids = bundle.ids()
+        sentences = []
+        for line in (x.strip(" -•\t") for x in text.splitlines()):
+            if not line:
+                continue
+            cited = extract_ids(line)
+            if not cited or any(c not in valid_ids for c in cited):
+                return None, "llm_ungrounded: a sentence cited no evidence or an unknown id"
+            sentences.append(NarrativeSentence(text=line, evidence_ids=cited))
+        if not sentences:
+            return None, "llm_empty"
+        return Answer(case_id=bundle.case_id, question=question, language=lang, source="llm", validated=True,
+                      sentences=sentences), None
 
-            facts_summary = [
-                {"id": item.id, "kind": item.kind.value, "label": item.label, "facts": item.facts}
-                for item in bundle.items
-            ]
+    def _complete(self, prompt: str) -> str:
+        s = self.settings
+        provider, key = s.llm_provider, s.llm_api_key
+        model = s.llm_model or DEFAULT_MODELS[provider]
 
-            prompt = (
-                f"You are UpayShield's AI Fraud Compliance Assistant.\n"
-                f"You must answer the question based ONLY on the evidence items below.\n"
-                f"Every factual sentence MUST cite at least one evidence ID in brackets like [TXN-1001] or [WALLET-017XX].\n"
-                f"Question: {question}\n"
-                f"Evidence: {json.dumps(facts_summary, indent=2)}\n\n"
-                f"Answer concisely in {language}:"
-            )
+        def post(url: str, body: dict, headers: dict) -> dict:
+            req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json", **headers})
+            with urllib.request.urlopen(req, timeout=s.llm_timeout_s) as resp:           # noqa: S310 (fixed https endpoints)
+                return json.loads(resp.read().decode())
 
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
-            req_body = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode("utf-8")
-            req = urllib.request.Request(url, data=req_body, headers={"Content-Type": "application/json"})
-
-            with urllib.request.urlopen(req, timeout=5.0) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-
-                sentences: list[NarrativeSentence] = []
-                for s in text.split("\n"):
-                    s = s.strip()
-                    if not s:
-                        continue
-                    found_ids = extract_ids(s)
-                    valid_ids = [fid for fid in found_ids if fid in bundle.ids()]
-                    if not valid_ids:
-                        valid_ids = bundle.what_happened[:1] or list(bundle.ids())[:1]
-                    sentences.append(NarrativeSentence(text=s, evidence_ids=valid_ids))
-
-                if sentences:
-                    return Answer(
-                        case_id=bundle.case_id,
-                        question=question,
-                        language=language,
-                        source="llm",
-                        validated=True,
-                        sentences=sentences,
-                    )
-        except Exception:
-            return None
-        return None
+        if provider == "gemini":
+            d = post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                     {"contents": [{"parts": [{"text": prompt}]}]}, {"x-goog-api-key": key})
+            return d["candidates"][0]["content"]["parts"][0]["text"].strip()
+        if provider == "anthropic":
+            d = post("https://api.anthropic.com/v1/messages",
+                     {"model": model, "max_tokens": 500, "messages": [{"role": "user", "content": prompt}]},
+                     {"x-api-key": key, "anthropic-version": "2023-06-01"})
+            return "".join(b.get("text", "") for b in d["content"]).strip()
+        if provider == "openai":
+            d = post("https://api.openai.com/v1/chat/completions",
+                     {"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 500},
+                     {"Authorization": f"Bearer {key}"})
+            return d["choices"][0]["message"]["content"].strip()
+        raise ValueError(f"unknown provider {provider}")

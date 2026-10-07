@@ -1,6 +1,8 @@
-"""Policy and Decision Engine for UpayShield.
-Enforces that policy rules can ONLY raise action severity, never lower it.
-Records full policy trace and determines final case priority.
+"""Policy and decision engine for UpayShield.
+
+The ML model proposes an action from its risk score using the thresholds learned by `ml.train`
+(optionally re-tuned from analyst feedback). Policy rules may only RAISE the severity, never lower it,
+and every raise is recorded in `policy_trace` so it can be audited.
 """
 from __future__ import annotations
 
@@ -14,14 +16,15 @@ from backend.app.contracts.schemas import (
     Decision,
     GraphSignals,
     PolicyHit,
-    RiskLevel,
 )
+
+DEFAULT_THRESHOLDS = [0.05, 0.10, 0.20]       # only used if no model artifact is available (tests / degraded mode)
 
 
 class DecisionEngine:
-    def __init__(self, thresholds: list[float] | None = None) -> None:
-        # Default thresholds [otp, hold, block]
-        self.thresholds = thresholds or [0.20, 0.25, 0.30]
+    def __init__(self, thresholds: list[float] | None = None, version: str = "model") -> None:
+        self.thresholds = list(thresholds) if thresholds else list(DEFAULT_THRESHOLDS)   # [otp, hold, block]
+        self.version = version
 
     def base_recommend(self, score: float) -> Action:
         t_otp, t_hold, t_block = self.thresholds
@@ -42,94 +45,78 @@ class DecisionEngine:
         agent_risk_score: float = 0.0,
         is_ring_member: bool = False,
     ) -> Decision:
-        rule_tags = rule_tags if rule_tags is not None else []
+        rule_tags = rule_tags or []
         base_action = self.base_recommend(risk_score)
-        current_action = base_action
-        current_severity = ACTION_SEVERITY[base_action]
-        policy_trace: list[PolicyHit] = []
+        current = base_action
+        trace: list[PolicyHit] = []
 
-        # Policy 1: Mule ring membership -> freeze wallet
+        def raise_to(target: Action, policy_id: str, text: str) -> None:
+            nonlocal current
+            if ACTION_SEVERITY[target] > ACTION_SEVERITY[current]:       # policies never lower the action
+                current = target
+                trace.append(PolicyHit(policy_id=policy_id, text=text, raises_to=target))
+
+        corroborated = ACTION_SEVERITY[base_action] >= ACTION_SEVERITY[Action.OTP_STEP_UP]   # model also sees risk
+
+        def soft(target: Action, policy_id: str, text: str) -> None:
+            """Rule-based escalation. A rule alone may only ask for step-up verification; HOLD/BLOCK need the model
+            to corroborate. (Measured: rules alone were wrong for legitimate travellers / customers of a flagged agent.)"""
+            if corroborated:
+                raise_to(target, policy_id, text)
+            else:
+                raise_to(Action.OTP_STEP_UP, policy_id, text + " Model did not corroborate, so capped at step-up.")
+
+        # Policy 1: mule-ring membership -> freeze wallet (network evidence is strong: 100% precise on held-out data)
         if is_ring_member or (graph_signals and graph_signals.ring_id):
-            target = Action.FREEZE_WALLET
-            if ACTION_SEVERITY[target] > current_severity:
-                current_action = target
-                current_severity = ACTION_SEVERITY[target]
-                policy_trace.append(
-                    PolicyHit(
-                        policy_id="POL_RING_FREEZE",
-                        text="Wallet identified as member of an active money-mule ring; auto-escalate to wallet freeze.",
-                        raises_to=target,
-                    )
-                )
-
-        # Policy 2: Rogue agent anomaly -> hold for human review
-        if agent_risk_score >= 0.85:
-            target = Action.HOLD
-            if ACTION_SEVERITY[target] > current_severity:
-                current_action = target
-                current_severity = ACTION_SEVERITY[target]
-                policy_trace.append(
-                    PolicyHit(
-                        policy_id="POL_AGENT_ANOMALY",
-                        text="Processing agent has an anomaly score >= 0.85 vs peer median; hold transaction.",
-                        raises_to=target,
-                    )
-                )
-
-        # Policy 3: Account Takeover (ATO) -> block
+            raise_to(Action.FREEZE_WALLET, "POL_RING_FREEZE",
+                     "Wallet is a member of a detected money-mule ring; escalate to wallet freeze.")
+        # Policy 2: rogue agent -> hold, but only when this transaction itself looks risky to the model
+        if agent_risk_score >= 0.85 and corroborated:
+            raise_to(Action.HOLD, "POL_AGENT_ANOMALY",
+                     "Processing agent scores >= 0.85 against its peers and the transaction is flagged; hold it.")
+        # Policy 3: account takeover signals -> block
         if "account_takeover" in rule_tags:
-            target = Action.BLOCK
-            if ACTION_SEVERITY[target] > current_severity:
-                current_action = target
-                current_severity = ACTION_SEVERITY[target]
-                policy_trace.append(
-                    PolicyHit(
-                        policy_id="POL_ATO_BLOCK",
-                        text="Account takeover signals confirmed (new device/location/night burst); block immediately.",
-                        raises_to=target,
-                    )
-                )
-
-        # Policy 4: Scam victim protection -> step-up verification / warn
+            soft(Action.BLOCK, "POL_ATO_BLOCK",
+                 "Account-takeover signals (new device + new location, or night-time burst).")
+        # Policy 4: scam-victim pattern -> step-up verification / warning
         if "scam_victim" in rule_tags:
-            target = Action.OTP_STEP_UP
-            if ACTION_SEVERITY[target] > current_severity:
-                current_action = target
-                current_severity = ACTION_SEVERITY[target]
-                policy_trace.append(
-                    PolicyHit(
-                        policy_id="POL_SCAM_PROTECT",
-                        text="High-value transfer to unverified recipient with scam patterns; require step-up authentication.",
-                        raises_to=target,
-                    )
-                )
+            raise_to(Action.OTP_STEP_UP, "POL_SCAM_PROTECT",
+                     "First-time recipient with an amount far above the user's norm; require step-up verification.")
+        # Policy 5: OTP given to / used by someone else -> block and force re-authentication
+        if "otp_breach" in rule_tags:
+            soft(Action.BLOCK, "POL_OTP_BREACH",
+                 "OTP confirmed from a different device while another session was active (or repeated OTP failures): "
+                 "possible OTP sharing / remote takeover.")
+        if "sim_swap" in rule_tags:
+            soft(Action.HOLD, "POL_SIM_SWAP", "Recent SIM swap combined with a new device.")
+        # Policy 6: betting payments -> confirmation with a responsible-use warning; repeated sessions -> hold
+        if "gambling" in rule_tags:
+            raise_to(Action.OTP_STEP_UP, "POL_GAMBLING",
+                     "Payment to a betting / gambling service; require confirmation and show a responsible-use warning.")
+        if "gambling_repeat" in rule_tags:
+            soft(Action.HOLD, "POL_GAMBLING_REPEAT",
+                 "Repeated betting payments within 24 hours (loss-chasing).")
 
-        # Determine AlertType by precedence
         alert_type: AlertType | None = None
         for tag in rule_tags:
             mapped = TAG_TO_ALERT_TYPE.get(tag)
-            if mapped:
-                if alert_type is None or ALERT_TYPE_PRECEDENCE.index(mapped) < ALERT_TYPE_PRECEDENCE.index(alert_type):
-                    alert_type = mapped
-
-        if alert_type is None and current_action != Action.ALLOW:
-            if is_ring_member or (graph_signals and "fan_in_hub" in graph_signals.flags):
+            if mapped and (alert_type is None or ALERT_TYPE_PRECEDENCE.index(mapped) < ALERT_TYPE_PRECEDENCE.index(alert_type)):
+                alert_type = mapped
+        if alert_type is None and current != Action.ALLOW:
+            if is_ring_member or (graph_signals and graph_signals.ring_id):
                 alert_type = AlertType.MULE_NETWORK
             elif agent_risk_score >= 0.85:
                 alert_type = AlertType.AGENT_ANOMALY
             else:
                 alert_type = AlertType.ANOMALY
 
-        risk_level = SEVERITY_TO_LEVEL[current_severity]
-        priority = round(risk_score * amount_bdt, 2)
-
         return Decision(
-            action=current_action,
-            risk_level=risk_level,
+            action=current,
+            risk_level=SEVERITY_TO_LEVEL[ACTION_SEVERITY[current]],
             base_action=base_action,
             alert_type=alert_type,
-            policy_trace=policy_trace,
-            requires_analyst=(current_action in (Action.HOLD, Action.ESCALATE)),
-            priority=priority,
-            thresholds_version="model-v1",
+            policy_trace=trace,
+            requires_analyst=current in (Action.HOLD, Action.ESCALATE),
+            priority=round(risk_score * amount_bdt, 2),
+            thresholds_version=self.version,
         )

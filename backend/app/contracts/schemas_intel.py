@@ -16,7 +16,7 @@ from backend.app.contracts.schemas import _M, Action, Language, Scalar
 # ---------------------------------------------------------------- graph
 class GraphNode(_M):
     id: str                                   # wallet / device / agent id as it appears in the data
-    kind: Literal["wallet", "device", "agent"]
+    kind: Literal["wallet", "device", "agent", "merchant"]
     label: str
     risk: float = Field(0.0, ge=0, le=1)      # graph heuristic, or max ML risk when attach_scores() was called
     ring_id: str | None = None

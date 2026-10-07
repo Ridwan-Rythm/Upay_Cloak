@@ -58,6 +58,8 @@ SEVERITY_TO_LEVEL: dict[int, RiskLevel] = {
 
 class AlertType(str, Enum):
     ACCOUNT_TAKEOVER = "account_takeover"
+    OTP_BREACH = "otp_breach"        # OTP shared with / intercepted by someone else
+    GAMBLING = "gambling"            # payments to betting services
     SCAM = "scam"
     MULE_NETWORK = "mule_network"
     AGENT_ANOMALY = "agent_anomaly"
@@ -66,13 +68,15 @@ class AlertType(str, Enum):
 
 
 # Deterministic precedence when several tags fire (first match wins).
-ALERT_TYPE_PRECEDENCE = [AlertType.ACCOUNT_TAKEOVER, AlertType.SCAM, AlertType.MULE_NETWORK,
-                         AlertType.AGENT_ANOMALY, AlertType.STRUCTURING, AlertType.ANOMALY]
+ALERT_TYPE_PRECEDENCE = [AlertType.OTP_BREACH, AlertType.ACCOUNT_TAKEOVER, AlertType.SCAM, AlertType.MULE_NETWORK,
+                         AlertType.AGENT_ANOMALY, AlertType.STRUCTURING, AlertType.GAMBLING, AlertType.ANOMALY]
 # ML rule tags (ml/rules.py) -> alert type
 TAG_TO_ALERT_TYPE: dict[str, AlertType] = {
     "account_takeover": AlertType.ACCOUNT_TAKEOVER, "scam_victim": AlertType.SCAM,
     "mule_passthrough": AlertType.MULE_NETWORK, "mule_network": AlertType.MULE_NETWORK,
     "agent_risk": AlertType.AGENT_ANOMALY, "structuring": AlertType.STRUCTURING,
+    "otp_breach": AlertType.OTP_BREACH, "sim_swap": AlertType.ACCOUNT_TAKEOVER,
+    "gambling": AlertType.GAMBLING, "gambling_repeat": AlertType.GAMBLING,
 }
 
 
@@ -101,6 +105,13 @@ class Transaction(_M):
     device_id: str
     location: str
     balance_before: float = Field(ge=0)
+    # --- optional context. Omitted -> treated as "normal / unknown" by the model
+    merchant_category: str | None = None      # what the money is for: grocery, utilities, ..., gambling
+    otp_requests_10m: int | None = Field(None, ge=0)
+    otp_failures_10m: int | None = Field(None, ge=0)
+    otp_device_mismatch: int | None = Field(None, ge=0, le=1)   # 1 = OTP confirmed from another device than requested
+    concurrent_sessions: int | None = Field(None, ge=1)
+    sim_swap_recent: int | None = Field(None, ge=0, le=1)       # 1 = SIM changed in the last 72h
 
 
 # ------------------------------------------------------------------ ML output (ml/score.py)
@@ -112,6 +123,8 @@ class WhatHappened(_M):
     location: str
     time: str                          # "YYYY-MM-DD HH:MM:SS" exactly as the ML module emits it
     agent: str | None = None
+    merchant_category: str | None = None   # grocery / utilities / ... / gambling (None for P2P and cash)
+    purpose: str | None = None             # what the money is for: betting, utilities, person_to_person, ...
 
 
 class RiskReason(_M):                  # SHAP factor

@@ -1,15 +1,19 @@
 """Generate the UpayShield sample dataset (synthetic, Bangladesh-flavoured mobile money).
 
-Writes ONE file, data/transactions.csv (time-sorted). ml/data.py makes the time-based
-70/30 train/test split, so nothing from the future leaks into training.
+Writes a time-based split so nothing from the future leaks into training:
+    data/train.csv  -> first 70% of the timeline
+    data/test.csv   -> last 30% of the timeline
 
 Normal behaviour: per-user habits (home city, device, usual hours, amount scale,
 contacts, agents). Fraud scenarios (injected after day 5 so users have history):
-    ato, scam_victim, mule_passthrough, structuring, rogue_agent
+    ato, otp_breach, scam_victim, mule_passthrough, structuring, rogue_agent, gambling
+Extra signals: merchant_category (what the money is spent on), OTP / session telemetry
+(otp_requests_10m, otp_failures_10m, otp_device_mismatch, concurrent_sessions, sim_swap_recent).
+`is_fraud` = 1 means illicit or unauthorized activity (fraud, laundering or prohibited betting payments).
 Realism knobs: salary-day spikes, legit large one-offs (rent, tuition), legit
 travel / new phones, and ~6% unreported fraud (label noise).
 
-Usage: python scripts/generate_data.py [--users 2000] [--days 30] [--seed 42]
+Usage: python scripts/generate_data.py [--users 800] [--days 30] [--seed 42]
 """
 import argparse
 from pathlib import Path
@@ -22,6 +26,10 @@ CITY_P = [.45, .15, .08, .08, .08, .05, .05, .06]
 TYPES = ["CASH_IN", "CASH_OUT", "TRANSFER", "PAYMENT"]
 START = pd.Timestamp("2026-01-01")
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
+TRAIN_FRAC = 0.70
+MERCHANT_CATEGORIES = ["grocery", "utilities", "telecom", "food", "transport", "education", "health", "shopping"]
+GAMBLING_MERCHANTS = [f"G{i:03d}" for i in range(5)]       # betting sites
+BOOKIE_WALLETS = [f"BK{i:02d}" for i in range(4)]          # P2P wallets used as bookmakers
 
 
 def generate(n_users=800, n_agents=40, days=30, seed=42):
@@ -29,6 +37,7 @@ def generate(n_users=800, n_agents=40, days=30, seed=42):
     users = [f"U{i:05d}" for i in range(n_users)]
     agents = [f"A{i:03d}" for i in range(n_agents)]
     merchants = [f"M{i:03d}" for i in range(30)]
+    mcat = {m: MERCHANT_CATEGORIES[i % len(MERCHANT_CATEGORIES)] for i, m in enumerate(merchants)}
     prof = {}
     for i, u in enumerate(users):
         prof[u] = dict(
@@ -46,10 +55,20 @@ def generate(n_users=800, n_agents=40, days=30, seed=42):
         return START + pd.Timedelta(days=int(day), hours=int(hour) % 24,
                                     minutes=int(rng.integers(0, 60)), seconds=int(rng.integers(0, 60)))
 
-    def add(t, user, typ, amount, recip, agent, device, loc, bal, fraud=0, scen="normal"):
+    def otp_normal(typ):
+        """Everyday OTP / session telemetry: mostly one OTP for money-out, rare typos, rare second session."""
+        return dict(req=int(typ in ("TRANSFER", "CASH_OUT")) + int(rng.random() < .03),
+                    fail=int(rng.random() < .04) + int(rng.random() < .005),
+                    mis=int(rng.random() < .004), conc=1 + int(rng.random() < .015), sim=int(rng.random() < .0015))
+
+    def add(t, user, typ, amount, recip, agent, device, loc, bal, fraud=0, scen="normal", cat=None, otp=None):
+        o = otp or otp_normal(typ)
         rows.append(dict(ts=t, user_id=user, type=typ, amount=round(float(amount), 0),
                          recipient_id=recip, agent_id=agent, device_id=device, location=loc,
-                         balance_before=round(float(bal), 0), is_fraud=fraud, scenario=scen))
+                         balance_before=round(float(bal), 0), merchant_category=cat,
+                         otp_requests_10m=int(o["req"]), otp_failures_10m=int(o["fail"]),
+                         otp_device_mismatch=int(o["mis"]), concurrent_sessions=int(o["conc"]),
+                         sim_swap_recent=int(o["sim"]), is_fraud=fraud, scenario=scen))
 
     # ---------- normal behaviour ----------
     day_w = np.array([1 + 0.6 * (d in (0, 1, days - 4, days - 3, days - 2, days - 1)) for d in range(days)])
@@ -78,7 +97,7 @@ def generate(n_users=800, n_agents=40, days=30, seed=42):
                 rec = agent
             dev = p["device"] if rng.random() > 0.02 else f"DNEW{rng.integers(1_000_000)}"   # new phone
             loc = p["city"] if rng.random() > 0.04 else str(rng.choice(CITIES))              # travel
-            add(ts(d, h), u, typ, amt, rec, agent, dev, loc, bal)
+            add(ts(d, h), u, typ, amt, rec, agent, dev, loc, bal, cat=mcat.get(rec) if typ == "PAYMENT" else None)
 
     # ---------- fraud: mule rings ----------
     rings = [dict(mules=[f"MU{r}-{j}" for j in range(5)], device=f"DR{r}",
@@ -106,7 +125,9 @@ def generate(n_users=800, n_agents=40, days=30, seed=42):
             t += pd.Timedelta(minutes=int(rng.integers(1, 5)))
             bal = p["balance"] * rng.uniform(.8, 1.3)
             amt = bal * rng.uniform(.25, .6)
-            add(t, u, "TRANSFER", amt, ring["mules"][0], None, dev, loc, bal, 1, "ato")
+            add(t, u, "TRANSFER", amt, ring["mules"][0], None, dev, loc, bal, 1, "ato",
+                otp=dict(req=int(rng.integers(1, 4)), fail=int(rng.choice([0, 0, 1, 2, 3])),
+                         mis=int(rng.random() < .35), conc=1 + int(rng.random() < .2), sim=int(rng.random() < .1)))
             if rng.random() < .6:
                 launder(t, ring, amt)
     for _ in range(100):                                      # scam victims -> mule hub
@@ -117,6 +138,38 @@ def generate(n_users=800, n_agents=40, days=30, seed=42):
         add(t, u, "TRANSFER", amt, ring["mules"][0], None, p["device"], p["city"], bal, 1, "scam_victim")
         if rng.random() < .8:
             launder(t, ring, amt)
+    for _ in range(45):                                       # OTP breach: victim is talked into reading out an OTP
+        u = str(rng.choice(users)); p = prof[u]; ring = rings[int(rng.integers(len(rings)))]
+        t = ts(rng.integers(lo, hi), int(rng.normal(p["hour_mu"], 3)) % 24)
+        dev = f"DX{rng.integers(1_000_000)}"                   # attacker's device
+        loc = p["city"] if rng.random() < .6 else str(rng.choice(CITIES))
+        for _ in range(int(rng.integers(1, 4))):
+            t += pd.Timedelta(minutes=int(rng.integers(1, 6)))
+            bal = p["balance"] * rng.uniform(.8, 1.3)
+            amt = min(bal * rng.uniform(.3, .7), 0.95 * bal)
+            add(t, u, "TRANSFER", amt, ring["mules"][0], None, dev, loc, bal, 1, "otp_breach",
+                otp=dict(req=int(rng.integers(2, 6)), fail=int(rng.choice([0, 0, 1, 2, 3])),
+                         mis=int(rng.random() < .85), conc=2 if rng.random() < .75 else 1, sim=int(rng.random() < .15)))
+            if rng.random() < .7:
+                launder(t, ring, amt)
+    for g in rng.choice(users, 20, replace=False):            # betting: loss-chasing sessions in the evening / at night
+        g = str(g); p = prof[g]
+        for day in rng.choice(np.arange(lo, hi), 4, replace=False):
+            t = ts(day, rng.integers(20, 26))
+            bal = p["balance"] * rng.uniform(.8, 1.3)
+            add(t - pd.Timedelta(minutes=5), g, "CASH_IN", bal * .3, str(rng.choice(p["agents"])), None, p["device"],
+                p["city"], bal * .4)                              # top-up before betting (not itself flagged)
+            stake = float(np.exp(p["mu"]) * rng.uniform(.5, 1.5))
+            for k in range(int(rng.integers(3, 6))):
+                t += pd.Timedelta(minutes=int(rng.integers(3, 12)))
+                stake = min(stake * rng.uniform(1.2, 1.6), 0.9 * bal)      # doubling down
+                if rng.random() < .7:
+                    add(t, g, "PAYMENT", stake, str(rng.choice(GAMBLING_MERCHANTS)), None, p["device"], p["city"],
+                        bal, 1, "gambling", cat="gambling")
+                else:
+                    add(t, g, "TRANSFER", stake, str(rng.choice(BOOKIE_WALLETS)), None, p["device"], p["city"],
+                        bal, 1, "gambling", cat="gambling")
+                bal = max(bal - stake, 1000.0)
     for _ in range(12):                                       # structuring under 50,000 BDT
         u = str(rng.choice(users)); p = prof[u]; ag = str(rng.choice(agents))
         t = ts(rng.integers(lo, hi), rng.integers(9, 14))
@@ -142,12 +195,15 @@ def generate(n_users=800, n_agents=40, days=30, seed=42):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--users", type=int, default=2000)
+    ap.add_argument("--users", type=int, default=800)
     ap.add_argument("--days", type=int, default=30)
     ap.add_argument("--seed", type=int, default=42)
     a = ap.parse_args()
     df = generate(a.users, days=a.days, seed=a.seed)
+    cut = int(len(df) * TRAIN_FRAC)                           # df is time-sorted -> time-based split
     DATA_DIR.mkdir(exist_ok=True)
-    df.to_csv(DATA_DIR / "transactions.csv", index=False)
-    print(f"transactions: {len(df):,} txns | {df.ts.min():%Y-%m-%d} -> {df.ts.max():%Y-%m-%d} | fraud {df.is_fraud.mean():.2%}")
+    df.iloc[:cut].to_csv(DATA_DIR / "train.csv", index=False)
+    df.iloc[cut:].to_csv(DATA_DIR / "test.csv", index=False)
+    for name, d in (("train", df.iloc[:cut]), ("test", df.iloc[cut:])):
+        print(f"{name}: {len(d):,} txns | {d.ts.min():%Y-%m-%d} -> {d.ts.max():%Y-%m-%d} | fraud {d.is_fraud.mean():.2%}")
     print(df.scenario.value_counts().to_string())

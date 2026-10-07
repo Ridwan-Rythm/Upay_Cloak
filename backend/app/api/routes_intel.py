@@ -4,12 +4,11 @@ Provides endpoints under `/api/v1` matching the API Contract.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 
 from backend.app.contracts.interfaces import Container
-from backend.app.contracts.schemas import Action, AgentRisk, Language
+from backend.app.contracts.schemas import AgentRisk, Language
 from backend.app.contracts.schemas_intel import (
     Answer,
     AskRequest,
@@ -28,13 +27,15 @@ router = APIRouter(prefix="/api/v1", tags=["intelligence"])
 
 @router.get("/graph", response_model=GraphView)
 def get_graph_view(
-    center: str = Query("019XX-XXX305", description="Center entity ID (wallet, device, or agent)"),
+    center: str | None = Query(None, description="Center entity ID (wallet, device, or agent). Default: busiest mule ring"),
     depth: int = Query(2, ge=1, le=4),
     max_nodes: int = Query(120, ge=10, le=300),
     as_of: datetime | None = None,
     container: Container = Depends(get_container),
 ) -> GraphView:
-    return container.intel.graph.view(center=center, depth=depth, max_nodes=max_nodes, as_of=as_of)
+    graph = container.intel.graph
+    center = center or (graph.default_center() if hasattr(graph, "default_center") else None) or ""
+    return graph.view(center=center, depth=depth, max_nodes=max_nodes, as_of=as_of)
 
 
 @router.get("/graph/rings", response_model=list[RingSummary])

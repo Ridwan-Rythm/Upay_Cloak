@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from ml.decision import recommend  # noqa: E402
 from ml.explain import Explainer  # noqa: E402
-from ml.rules import rule_trace  # noqa: E402,F401  (single shared copy; cache.py imports it from here)
+from ml.rules import purpose_of, rule_trace  # noqa: E402,F401  (re-exported for ml.cache / backend)
 
 MODEL_PATH = ROOT / "models" / "risk_engine.joblib"
 
@@ -26,6 +26,7 @@ class RiskEngine:
         self.model, self.anomaly = art["model"], art["anomaly"]
         self.features, self.th = art["features"], art["thresholds"]
         self.version, self.name = art.get("version", "?"), art.get("name", "?")
+        self.th_model = art.get("thresholds_model", art["thresholds"])      # learned by ml.train (before feedback)
         self.explainer = Explainer(self.model, self.features)
 
     def predict(self, feats: pd.DataFrame):
@@ -47,7 +48,10 @@ class RiskEngine:
             cases.append(dict(
                 txn_id=r.txn_id, user_id=r.user_id,
                 what_happened=dict(type=r.type, amount_bdt=r.amount, recipient=r.recipient_id,
-                                   device=r.device_id, location=r.location, time=str(r.ts)),
+                                   device=r.device_id, location=r.location, time=str(r.ts),
+                                   agent=r.agent_id if pd.notna(r.agent_id) and r.agent_id else None,
+                                   merchant_category=r.merchant_category if pd.notna(r.merchant_category) else None,
+                                   purpose=purpose_of(r.type, r.merchant_category)),
                 why_risky=dict(risk_score=round(float(risk[i]), 4), anomaly_score=round(float(anomaly[i]), 4),
                                feature_contributions=shap_out.get(i),
                                rule_trace=trace, tags=sorted({h["tag"] for h in trace})),

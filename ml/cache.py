@@ -6,7 +6,7 @@ minutes at scale). Do it ONCE here; the backend then just reads a parquet file.
     python -m ml.cache                       # (re)build  data/cache/scored_cache.parquet
     from ml.cache import load_cache          # backend startup: loads (builds only if missing)
 
-Columns: all raw transaction columns + the 23 model features + split (train/test) + risk_score,
+Columns: all raw transaction columns + the model features + split (train/test) + risk_score,
 anomaly_score, action, tags (comma-separated rule tags) and reasons (JSON string with the SHAP
 top-positive / top-negative factors; filled for flagged rows only, empty for "allow").
 Rebuild after every retrain, because the scores depend on the model.
@@ -16,20 +16,23 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from ml.data import DATA_PATH, load_transactions  # noqa: E402
 from ml.features import build_features  # noqa: E402
-from ml.score import MODEL_PATH, RiskEngine, rule_trace  # noqa: E402
+from ml.rules import rule_trace  # noqa: E402
+from ml.score import MODEL_PATH, RiskEngine  # noqa: E402
 
 CACHE_PATH = ROOT / "data" / "cache" / "scored_cache.parquet"
+DEFAULT_CSVS = [ROOT / "data" / "train.csv", ROOT / "data" / "test.csv"]
 
 
 def build_cache(csvs=None, model_path=MODEL_PATH, out=CACHE_PATH):
     t0 = time.time()
-    raw = load_transactions(csvs)                    # one dataset, time-based train/test `split` column
+    csvs = [Path(c) for c in (csvs or DEFAULT_CSVS)]
+    raw = pd.concat([pd.read_csv(c, parse_dates=["ts"]).assign(split=c.stem) for c in csvs], ignore_index=True)
     feats = build_features(raw)                      # point-in-time, over the whole timeline in order
     eng = RiskEngine(model_path)
     risk, anomaly, actions = eng.predict(feats)
@@ -45,7 +48,7 @@ def build_cache(csvs=None, model_path=MODEL_PATH, out=CACHE_PATH):
 
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    feats.to_parquet(out, index=False)
+    feats.drop(columns=["_part"], errors="ignore").to_parquet(out, index=False)
     print(f"cache built: {len(feats):,} txns ({len(flagged):,} flagged with SHAP reasons) "
           f"-> {out.relative_to(ROOT)} [{out.stat().st_size / 1e6:.1f} MB, {time.time() - t0:.1f}s]")
     return feats
@@ -61,9 +64,19 @@ def load_cache(path=CACHE_PATH, rebuild_if_missing=True) -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
+def is_stale(cache: pd.DataFrame, engine: RiskEngine, n=300) -> bool:
+    """True if the cached scores do not match the current model / thresholds / feature set."""
+    needed = set(engine.features) | {"risk_score", "action", "split", "reasons", "tags"}
+    if not needed <= set(cache.columns):
+        return True
+    probe = cache.sample(min(n, len(cache)), random_state=0)
+    risk, _, actions = engine.predict(probe)
+    return not (np.allclose(risk, probe.risk_score.values, atol=2e-3) and list(actions) == list(probe.action))
+
+
 if __name__ == "__main__":
     import argparse
 
     ap = argparse.ArgumentParser(description="Build the scored cache")
-    ap.add_argument("--csv", nargs="+", help="CSV file(s) to score (default: data/transactions.csv)")
+    ap.add_argument("--csv", nargs="+", help="CSV file(s) in time order (default: data/train.csv data/test.csv)")
     build_cache(ap.parse_args().csv)

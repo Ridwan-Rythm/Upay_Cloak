@@ -1,65 +1,145 @@
 {
-  "data": {
-    "n_test": 19928,
-    "test_fraud_rate": 0.019,
-    "best_iteration": 76
+  "version": "v1.2",
+  "best_model": "LightGBM",
+  "split": {
+    "train": 18384,
+    "valid": 4597,
+    "test": 9850
   },
-  "lightgbm_only": {
-    "roc_auc": 0.9993,
-    "pr_auc": 0.9485,
-    "precision@0.5%": 0.9495,
-    "recall@0.5%": 0.248,
-    "precision@1.0%": 0.9497,
-    "recall@1.0%": 0.4987,
-    "precision@2.0%": 0.9221,
-    "recall@2.0%": 0.9683
-  },
-  "isolation_forest_only": {
-    "roc_auc": 0.9874,
-    "pr_auc": 0.6779,
-    "precision@0.5%": 0.9091,
-    "recall@0.5%": 0.2375,
-    "precision@1.0%": 0.7538,
-    "recall@1.0%": 0.3958,
-    "precision@2.0%": 0.5829,
-    "recall@2.0%": 0.6121
-  },
-  "blended": {
-    "roc_auc": 0.9985,
-    "pr_auc": 0.9413,
-    "precision@0.5%": 0.9495,
-    "recall@0.5%": 0.248,
-    "precision@1.0%": 0.9447,
-    "recall@1.0%": 0.496,
-    "precision@2.0%": 0.9246,
-    "recall@2.0%": 0.971
+  "models": {
+    "Logistic Regression": {
+      "valid": {
+        "roc_auc": 0.9986,
+        "pr_auc": 0.9671,
+        "precision@1%": 0.9556,
+        "recall@1%": 0.1587,
+        "precision@3%": 0.9781,
+        "recall@3%": 0.4945
+      },
+      "test": {
+        "roc_auc": 0.998,
+        "pr_auc": 0.9151,
+        "precision@1%": 0.9286,
+        "recall@1%": 0.2376,
+        "precision@3%": 0.9288,
+        "recall@3%": 0.7154
+      },
+      "cv_pr_auc": 0.9378
+    },
+    "Random Forest": {
+      "valid": {
+        "roc_auc": 0.9984,
+        "pr_auc": 0.9611,
+        "precision@1%": 0.9556,
+        "recall@1%": 0.1587,
+        "precision@3%": 0.9635,
+        "recall@3%": 0.4871
+      },
+      "test": {
+        "roc_auc": 0.9977,
+        "pr_auc": 0.8957,
+        "precision@1%": 0.9082,
+        "recall@1%": 0.2324,
+        "precision@3%": 0.9186,
+        "recall@3%": 0.7076
+      },
+      "cv_pr_auc": 0.9364
+    },
+    "LightGBM": {
+      "valid": {
+        "roc_auc": 0.9985,
+        "pr_auc": 0.9632,
+        "precision@1%": 0.9778,
+        "recall@1%": 0.1624,
+        "precision@3%": 0.9562,
+        "recall@3%": 0.4834
+      },
+      "test": {
+        "roc_auc": 0.998,
+        "pr_auc": 0.9199,
+        "precision@1%": 0.9388,
+        "recall@1%": 0.2402,
+        "precision@3%": 0.9356,
+        "recall@3%": 0.7206
+      },
+      "cv_pr_auc": 0.949
+    },
+    "Isolation Forest (unsupervised)": {
+      "valid": {
+        "roc_auc": 0.9632,
+        "pr_auc": 0.6478,
+        "precision@1%": 0.7778,
+        "recall@1%": 0.1292,
+        "precision@3%": 0.8175,
+        "recall@3%": 0.4133
+      },
+      "test": {
+        "roc_auc": 0.9748,
+        "pr_auc": 0.6749,
+        "precision@1%": 0.8061,
+        "recall@1%": 0.2063,
+        "precision@3%": 0.7661,
+        "recall@3%": 0.5901
+      }
+    }
   },
   "business_impact": {
     "thresholds": {
-      "otp_step_up": 0.2,
-      "hold": 0.25,
-      "block": 0.3
+      "otp_step_up": 0.05,
+      "hold": 0.1,
+      "block": 0.2
     },
-    "fraud_value_total_bdt": 3224488.0,
-    "fraud_value_prevented_bdt": 2995855.1499999994,
-    "pct_fraud_value_prevented": 0.9291,
-    "legit_txns_with_friction_pct": 0.005,
-    "alert_rate_pct": 0.0237,
-    "friction_cost_bdt": 8900.0,
-    "net_benefit_bdt": 2986955.1499999994,
-    "analyst_queue_size": 392,
+    "fraud_value_total_bdt": 3004859.0,
+    "fraud_value_prevented_bdt": 2824295.45,
+    "pct_fraud_value_prevented": 0.9399,
+    "legit_txns_with_friction_pct": 0.0126,
+    "alert_rate_pct": 0.0506,
+    "friction_cost_bdt": 20900.0,
+    "net_benefit_bdt": 2803395.45,
+    "analyst_queue_size": 462,
     "actions": {
-      "allow": 19456,
-      "otp_step_up": 80,
-      "hold": 18,
-      "block": 374
+      "allow": 9352,
+      "otp_step_up": 36,
+      "hold": 28,
+      "block": 434
     }
   },
   "scenario_recall": {
     "ato": 1.0,
+    "gambling": 1.0,
     "mule_passthrough": 1.0,
-    "scam_victim": 0.886,
+    "otp_breach": 0.929,
+    "rogue_agent": 1.0,
+    "scam_victim": 0.923,
     "structuring": 1.0
   },
-  "notes": "Synthetic data with 6% label noise and legit large one-offs; treat absolute numbers as indicative only."
+  "quality": {
+    "calibration": {
+      "brier": 0.0051,
+      "ece": 0.0038
+    },
+    "precision_by_action": {
+      "allow": 0.0004,
+      "otp_step_up": 0.0278,
+      "hold": 0.1071,
+      "block": 0.8641
+    },
+    "threshold_cost_bdt": 201464,
+    "oracle_threshold_cost_bdt": 201464,
+    "oracle_thresholds": [
+      0.05,
+      0.1,
+      0.2
+    ],
+    "scenario_recall_hold_or_block": {
+      "ato": 1.0,
+      "gambling": 1.0,
+      "mule_passthrough": 1.0,
+      "otp_breach": 0.929,
+      "rogue_agent": 1.0,
+      "scam_victim": 0.885,
+      "structuring": 1.0
+    }
+  },
+  "notes": "Synthetic data with ~6% label noise. Absolute numbers are optimistic; use for model comparison. Scores are class-weighted ranking scores, not calibrated probabilities (see quality.calibration)."
 }

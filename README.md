@@ -1,370 +1,59 @@
-# UpayShield (Upay_cloak)
-**A Case-Centric Trust & Risk Intelligence Platform for Mobile Financial Services**
+# UpayShield (Upay_Cloak): AI fraud protection for mobile money
 
-Built for the **Upay AI Dev Fest — Track 01: Trust & Risk Intelligence**  
-*The analyst dashboard and customer-facing UI are branded **Upay_cloak**.*
+A trained ML model scores every transaction; a FastAPI backend turns the score into a decision, a case and a plain-language explanation; a static dashboard shows it. All data is **synthetic**.
 
----
-
-## Table of Contents
-1. [Project Overview](#1-project-overview)
-2. [Features & AI Usage](#2-features--ai-usage)
-3. [Technology Stack](#3-technology-stack)
-4. [System Architecture](#4-system-architecture)
-5. [Requirements & Prerequisites](#5-requirements--prerequisites)
-6. [Installation & Setup](#6-installation--setup)
-7. [Environment Variables](#7-environment-variables)
-8. [Run & Build Commands](#8-run--build-commands)
-9. [Live Deployment URL](#9-live-deployment-url)
-10. [Testing & Verification Instructions](#10-testing--verification-instructions)
-11. [Other Configuration](#11-other-configuration)
-12. [Evaluation & Business Impact](#12-evaluation--business-impact)
-13. [Conclusion & Roadmap](#13-conclusion--roadmap)
-14. [Team & Contributions](#14-team--contributions)
-
----
-
-## 1. Project Overview
-
-### The Problem
-Mobile Financial Services (MFS) platforms like Upay face diverse and sophisticated fraud patterns simultaneously:
-- **Account Takeover (ATO):** Fraudsters gain access to legitimate accounts via SIM swaps or social engineering, change devices, and drain balances in seconds.
-- **Money-Mule Networks:** Dispersed rings of accounts funnel illicit funds through layered pass-through transfers to central cash-out agents.
-- **Scam Victims:** Customers are manipulated into willingly authorizing transfers to fraudsters (lottery scams, fake customer-care calls), where typical authentication fails to protect them.
-- **Rogue Agents:** Malicious or compromised cash-in/cash-out agents engage in structuring (smurfing under the 50,000 BDT regulatory threshold) and unusual off-hour transaction volume.
-
-Most conventional fraud tools generate isolated probability scores without context. Fraud analysts are forced to manually piece together disparate logs, leading to slow response times, high operational overhead, inconsistent decisions, and unnecessary friction for honest users.
-
-### The Proposed Solution
-**UpayShield** transforms fraud operations from reactive score-checking into a **case-centric investigation and automated decisioning ecosystem**. For every single transaction and alert, UpayShield answers three fundamental questions:
-
-| Question | How UpayShield Answers It |
+## What it detects
+| Threat | Signals the model uses |
 |---|---|
-| **1. What happened?** | A chronological transaction timeline with immutable, auditable evidence IDs (`E1`, `E2`, `E3`). |
-| **2. Why is it risky?** | Transparent risk decomposition: LightGBM score, local SHAP-style reason contributions, behavioral deviations vs. the user's historical baseline, graph topology flags, and explicit rule hits. |
-| **3. What should Upay do next?** | Recommended policy actions (**Allow**, **Customer Warning**, **Step-up OTP/PIN**, **Hold for Review**, **Block**, **Freeze Wallet**) with full audit trail logging and analyst feedback integration. |
+| Account takeover | new device / location, night burst, amount vs. the user's own history |
+| **OTP breach** (OTP shared with a stranger) | OTP confirmed from a *different device*, 2 sessions at once, OTP request bursts, failed OTPs, recent SIM swap |
+| **Betting / gambling** | payment to a betting merchant or bookie wallet, repeated payments in 24h (loss-chasing), 7-day betting spend, new spending category |
+| **What the money is for** | purpose per transaction (betting, utilities, person-to-person, cash...) + the user's usual spending profile |
+| Scam victim | first-time recipient with an amount far above normal |
+| Mule rings | rapid pass-through (money forwarded within 30 min), rings found as connected mule wallets, frozen |
+| Structuring, rogue agents | cash-outs just under 50,000 BDT; agent night bursts vs. peers |
 
-### Purpose of the Project
-To provide Upay with a production-grade, end-to-end trust and risk engine that detects emerging threats in real time, slashes fraud loss, prevents customer harm via pre-transaction nudges in **English and Bangla**, and empowers fraud analysts with grounded, explainable AI.
-
----
-
-## 2. Features & AI Usage
-
-### Core Modules & AI Implementation
-
-| # | Feature / Module | AI / Algorithmic Implementation |
-|---|---|---|
-| **1** | **Real-Time Transaction Risk Scoring** | High-throughput **LightGBM Classifier** combined with a cost-sensitive decision engine returning risk scores (0.0 to 1.0) and recommended actions in about **15 ms** per transaction (model + anomaly score, excluding feature computation). |
-| **2** | **Behavioral Anomaly Detection** | **Isolation Forest** coupled with rolling per-user statistical baselines (amount z-score, transacting hours, recipient novelty, and device velocity). |
-| **3** | **Account Takeover (ATO) Detection** | Multi-signal heuristic and classifier rules detecting abrupt changes in device fingerprint, geo-location hops, late-night activity, and rapid balance drain. |
-| **4** | **Mule & Network Ring Discovery** | In-memory **NetworkX Graph Engine** analyzing directed transaction flows, identifying high fan-in/fan-out ratios, rapid pass-through velocity, shared device clusters, and community subgraphs. |
-| **5** | **Agent Risk & Structuring Intelligence** | Peer-group anomaly profiling comparing each cash-in/out agent against regional peer distributions, flagging structuring just below 50,000 BDT and off-hour bursts. |
-| **6** | **Explainability & Factor Attribution** | Global and local **SHAP-style explainability**, breaking down every flagged score into positive (risk-increasing) and negative (risk-reducing) contributions with human-readable rationale. |
-| **7** | **Grounded AI Investigation Assistant** | Dual-mode assistant (Google Gemini / OpenAI / Anthropic or deterministic template engine) strictly grounded in structured `EvidenceBundle` JSON. Every narrative or answer cites immutable evidence IDs (`E1`, `RULE-ATO`, `METRIC-risk_score`) to eliminate hallucination. |
-| **8** | **Dual-Language Customer Scam Warning** | Pre-transaction nudge modal supporting both **English and Bangla (বাংলা)**, intercepting scam payments before money leaves the sender's wallet. |
-| **9** | **Analyst Case Queue & Audit Trail** | Prioritized queue by risk tier and alert type (`account_takeover`, `mule_network`, `scam`, `agent_anomaly`) with one-click actions (`Hold`, `Block`, `Request KYC`, `Escalate`, `False Positive`) recorded to an immutable audit trail. |
-| **10**| **Live Screening Simulation Feed** | Real-time transaction ingestion stream with pause, resume, reset controls, and real-time risk classification gauges. |
-
----
-
-## 3. Technology Stack
-
-### Backend & Machine Learning
-- **Language:** Python 3.10+
-- **API Framework:** FastAPI, Starlette, Uvicorn (ASGI)
-- **Machine Learning:** LightGBM, scikit-learn (Random Forest, Logistic Regression, Isolation Forest), NumPy, Pandas
-- **Explainability:** SHAP (TreeExplainer / LinearExplainer local attribution)
-- **Graph Analytics:** NetworkX (Directed Graph, MultiDiGraph, Cycle and Ring Detection)
-- **Data & Storage:** PyArrow / Parquet (pre-computed fast-scoring cache), SQLite, Joblib
-- **Validation & Settings:** Pydantic v2, Pydantic-Settings
-- **LLM Integrations (Optional):** Google Gemini (`gemini-2.0-flash`), OpenAI (`gpt-4o-mini`), Anthropic (`claude-3-5-haiku`) with deterministic template fallback
-
-### Frontend (Dashboard & Mobile Warning Demo)
-- **Core:** Vanilla JavaScript (ES6+), HTML5, CSS3 (zero build steps, zero node dependencies)
-- **Data Visualizations:** Chart.js (risk distributions, alert trends, feature contributions)
-- **Network Graph Rendering:** Vis-network (interactive multi-hop graph explorer)
-- **Typography:** Plus Jakarta Sans, Noto Sans Bengali (বাংলা)
-
-### Testing & Code Quality
-- **Testing:** PyTest, PyTest-Asyncio, HTTPX / TestClient
-- **Linting & Formatting:** Ruff
-
----
-
-## 4. System Architecture
-
-```
-                                 ┌───────────────────────────────┐
-                                 │     Transactions Dataset      │
-                                 │    (PaySim-style + BDT MFS)   │
-                                 └───────────────┬───────────────┘
-                                                 │
-                                                 ▼
-                                 ┌───────────────────────────────┐
-                                 │  Point-in-Time Feature Engine │
-                                 │   (23 behavioral features)    │
-                                 └───────────────┬───────────────┘
-                                                 │
-                        ┌────────────────────────┼────────────────────────┐
-                        ▼                        ▼                        ▼
-             ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐
-             │ LightGBM Classifier │  │  Isolation Forest   │  │   NetworkX Graph    │
-             │ (Supervised Risk)   │  │ (Behavior Anomaly)  │  │(Mule Ring Analytics)│
-             └──────────┬──────────┘  └──────────┬──────────┘  └──────────┬──────────┘
-                        │                        │                        │
-                        └────────────────────────┼────────────────────────┘
-                                                 ▼
-                                 ┌───────────────────────────────┐
-                                 │  Risk Engine & Decision Policy│
-                                 │  - Tuned Action Thresholds    │
-                                 │  - SHAP Factor Contributions  │
-                                 │  - Rule & Policy Trace        │
-                                 └───────────────┬───────────────┘
-                                                 │
-                                                 ▼
-                                 ┌───────────────────────────────┐
-                                 │    FastAPI Unified Backend    │
-                                 │   - /api/v1/score, /api/cases │
-                                 │   - Grounded AI Assistant     │
-                                 │   - Static Frontend Hosting   │
-                                 └───────────────┬───────────────┘
-                                                 │
-                        ┌────────────────────────┴────────────────────────┐
-                        ▼                                                 ▼
-             ┌─────────────────────┐                           ┌─────────────────────┐
-             │  Analyst Dashboard  │                           │ Customer Phone Demo │
-             │ (Queue, Cases, Graph│                           │(English & Bangla UI)│
-             └─────────────────────┘                           └─────────────────────┘
-```
-
----
-
-## 5. Requirements & Prerequisites
-
-### System Requirements
-- **Operating System:** Windows 10/11, macOS (Intel/Apple Silicon), or Linux (Ubuntu 20.04+)
-- **Python:** Python 3.10, 3.11, 3.12, 3.13, or 3.14
-- **Hardware:** Standard CPU (minimum 4 GB RAM; no dedicated GPU required)
-- **Web Browser:** Any modern web browser (Google Chrome, Microsoft Edge, Mozilla Firefox, Safari)
-
----
-
-## 6. Installation & Setup
-
-Follow these exact steps to set up the project on your machine:
-
-### 1. Clone the Repository
+## Run it
 ```bash
-git clone https://github.com/Ridwan-Rythm/Upay_Cloak.git
-cd Upay_Cloak
-```
-
-### 2. Create and Activate a Python Virtual Environment
-**On Windows (PowerShell):**
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-```
-
-**On macOS / Linux:**
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-### 3. Install Dependencies
-```bash
-python -m pip install --upgrade pip
 pip install -r requirements.txt
+python scripts/generate_data.py      # optional: data/ is committed (seed 42, reproducible)
+python -m ml.train                   # trains, tunes thresholds, writes models/, reports/, data/cache/
+uvicorn backend.main:app --port 8000 # open http://localhost:8000
+python -m pytest tests -q            # 47 tests
 ```
+If `models/risk_engine.joblib` is missing the API starts in degraded mode (scoring endpoints return `503 model_not_loaded`); set `UPAY_AUTO_TRAIN=true` to train on boot.
 
-### 4. Create the Configuration File
-Copy the example environment configuration:
-```bash
-# On Windows PowerShell:
-Copy-Item .env.example .env
+## How the backend uses the ML
+`ScoringService` loads the model and replays history into a rolling feature state (same code as training, tested to match). The held-out test period is replayed through the model at start-up; every non-allow becomes a case. Pages: **Dashboard** (live model-scored feed), **Cases** (what happened / why risky / what next, baseline, purpose, evidence, grounded Q&A, analyst actions), **Graph**, **Warning demo** (real transactions, editable amount/recipient, scored live, EN/বাংলা).
 
-# On macOS / Linux:
-cp .env.example .env
-```
+- `POST /api/v1/score` `{txn_id}` or `{transaction, commit}`: stored or live model score (+ cold-start / over-balance warnings)
+- `POST /api/v1/warning/check`: pre-send customer warning (EN/BN) from the model
+- `GET /api/v1/cases | /kpis | /metrics | /config`, `POST /api/v1/cases/{id}/feedback`, `GET /api/v1/feedback/export` (CSV for `python -m ml.feedback`)
+- `GET /api/v1/stream` (SSE), `/stream/control`; `POST /api/v1/admin/thresholds/adapt|reset` (learn thresholds from analyst verdicts, bounded)
+- `GET /api/v1/graph/rings`, `/agents`, `/cases/{id}/evidence|narrative|ask|report` (Markdown / real PDF); `/api/*` serves the dashboard. Docs: `/docs`, contract: `docs/API_CONTRACT.md`.
 
----
+Decision = model thresholds (learned by `ml.train`, never hard-coded) + policies. Policies only *raise* actions; a rule alone is capped at step-up verification, HOLD/BLOCK need the model to agree, ring members are frozen.
 
-## 7. Environment Variables
-
-All settings are managed via [`backend/app/config.py`](backend/app/config.py) and read from `.env` or system environment variables. **Every variable includes a safe default, so the application boots and functions with zero configuration.**
-
-| Variable | Type | Default | Description |
+## Model results (held-out last 7 days, 9,850 txns, 3.9% illicit)
+Model selected by time-series CV (not a single noisy split): **LightGBM**.
+| Model | CV PR-AUC | Test ROC-AUC | Test PR-AUC |
 |---|---|---|---|
-| `UPAY_DATA_PATH` | Path | `data/transactions.csv` | Path to the raw/enriched transactions CSV file. |
-| `UPAY_MODEL_PATH` | Path | `models/risk_engine.joblib` | Path to the trained ML model artifact bundle. |
-| `UPAY_REPORTS_DIR` | Path | `reports` | Directory where evaluation metrics and comparison charts are saved. |
-| `UPAY_CACHE_DIR` | Path | `data/cache` | Directory storing the fast Parquet scoring cache. |
-| `UPAY_DB_PATH` | Path | `data/upayshield.db` | SQLite database path for persistent case state and audit logs. |
-| `UPAY_AUTO_TRAIN` | Boolean | `false` | If `true`, automatically executes `ml.train` on boot if model artifacts are missing. |
-| `UPAY_CORS_ORIGINS` | JSON list | `["*"]` | Allowed HTTP CORS origins for external API access. |
-| `UPAY_STREAM_DEFAULT_INTERVAL_MS`| Integer | `3500` | Ingestion speed (ms) for the dashboard live transaction feed. |
-| `UPAY_STREAM_DEMO_ALERT_EVERY` | Integer | `6` | Generates a high-priority flagged alert every N simulated stream events. |
-| `UPAY_LLM_PROVIDER` | String | `none` | AI Assistant provider: `none` (grounded template fallback), `gemini`, `openai`, or `anthropic`. |
-| `UPAY_LLM_API_KEY` | String | *None* | API key for the chosen LLM provider (e.g., Google AI Studio, OpenAI, or Anthropic). |
-| `UPAY_LLM_MODEL` | String | *Provider default* | Model name override (e.g. `gemini-2.0-flash` or `gpt-4o-mini`). |
-| `UPAY_LLM_TIMEOUT_S` | Float | `8.0` | Maximum network timeout in seconds for LLM generation. |
+| Logistic Regression | 0.938 | 0.998 | 0.915 |
+| Random Forest | 0.936 | 0.998 | 0.896 |
+| **LightGBM** | **0.949** | 0.998 | **0.920** |
+| Isolation Forest | n/a | 0.975 | 0.675 |
 
-> **Note on LLM API Keys:** If `UPAY_LLM_PROVIDER=none` or no API key is provided, the assistant automatically uses the built-in deterministic, evidence-grounded template engine. It operates with **zero latency** and **100% reliability**, citing valid evidence IDs.
+Business impact: **94.0%** of fraud value prevented, **1.26%** of legitimate transactions get friction. Precision by action: allow 0.04% fraud, step-up 2.8%, hold 10.7%, block 86%. Recall by scenario (any action): ATO, gambling, mule, structuring, rogue agent 100%; OTP breach 93%; scam victim 92% (hold/block only 88%). Brier 0.005. Scoring latency about 20 ms.
 
----
+**Be honest about limits:** data is synthetic with 6% label noise, so absolute numbers are optimistic. Scam victims are the hardest class (a legitimate large first-time transfer looks the same), and about 14% of "block"s are such legitimate one-offs. Betting detection relies on knowing the merchant category. Scores are class-weighted ranking scores, not calibrated probabilities.
 
-## 8. Run & Build Commands
+## Bugs fixed in this version
+- Backend never called the ML (`/score` was `if amount > 30000`, cases/KPIs/metrics hard-coded, thresholds 0.20/0.25/0.30 hard-coded). Now everything comes from the model.
+- Stale `transactions.csv` with colliding txn ids was loaded instead of the model's data (removed).
+- Model selection picked the worst model on test (Random Forest) from one tiny validation slice; now time-series CV. `ml/evaluate.py` imported a function that didn't exist; duplicated, diverging rule code merged.
+- Mule detector flagged 870 innocent wallets/agents as 732 "rings"; now 6 rings, 24/24 mules. Agent policy held 158 legitimate customers; ATO rule blocked travellers; thresholds missed the rogue agents. Fake seeded agents / fake freeze numbers removed.
+- "PDF" report was Markdown bytes; LLM path always called Gemini and accepted uncited sentences; "hold" was stored as a fraud verdict and the feedback CSV couldn't be read by `ml.feedback`; errors now use the contract shape.
+- Frontend: POSTs lacked `Content-Type`, errors were ignored, the feed was generated in the browser, graph searched `/graph/null`, evidence chips threw, root-level duplicate pages removed.
 
-### Step 1: Train & Build ML Artifacts
-The dataset is pre-generated as `data/transactions.csv`; `ml.train` splits it 70/30 by time. Run the ML pipeline to train models, compute decision thresholds, generate SHAP importances, and compile the instant-boot scoring cache:
-```bash
-python -m ml.train
-```
-
-To quickly verify scoring output on test cases:
-```bash
-python -m ml.score
-```
-
-*(Optional) To synthesize a fresh dataset of similar size (`--users 2000` gives about 79k rows; the committed file came from a slightly earlier generator version, so it will not be byte-identical):*
-```bash
-python scripts/generate_data.py --users 2000 --seed 42
-```
-
-### Step 2: Start the Unified Backend & Frontend Server
-Launch the unified FastAPI application on port 8000:
-```bash
-python -m uvicorn backend.main:app --reload --port 8000
-```
-
-### Step 3: Open the Platform
-Open your browser and visit:
-- **Dashboard & Alert Queue:** [http://localhost:8000](http://localhost:8000)
-- **Interactive Network Graph Explorer:** [http://localhost:8000/graph.html](http://localhost:8000/graph.html)
-- **Customer Scam Warning Demo (EN/BN):** [http://localhost:8000/demo.html](http://localhost:8000/demo.html)
-- **Case Investigation View:** [http://localhost:8000/case.html?id=CASE-1001](http://localhost:8000/case.html?id=CASE-1001)
-- **Interactive OpenAPI / Swagger Documentation:** [http://localhost:8000/docs](http://localhost:8000/docs)
-
----
-
-## 9. Live Deployment URL
-
-- **Primary Live Deployment:** [https://upay-cloak.onrender.com](https://upay-cloak.onrender.com) *(or your deployed production URL)*
-- **Interactive API Documentation:** [https://upay-cloak.onrender.com/docs](https://upay-cloak.onrender.com/docs)
-- **Local Host URL (Judge Testing):** [http://localhost:8000](http://localhost:8000)
-
-> **Deployment Note for Judges:** The backend is fully containerized and cloud-ready. To deploy on Docker, Render, Railway, or Google Cloud Run, execute:
-> ```bash
-> uvicorn backend.main:app --host 0.0.0.0 --port $PORT
-> ```
-
----
-
-## 10. Testing & Verification Instructions
-
-### 1. Automated Integration Test Suite
-The repository includes an automated test suite verifying all core API contracts, frontend routes, graph analytics, case investigations, and actions:
-```bash
-python -m pytest tests/test_api.py -v
-```
-
-**Expected Output:**
-```text
-tests/test_api.py::test_health PASSED
-tests/test_api.py::test_config PASSED
-tests/test_api.py::test_frontend_overview PASSED
-tests/test_api.py::test_frontend_cases PASSED
-tests/test_api.py::test_frontend_case_detail_and_ask PASSED
-tests/test_api.py::test_frontend_action_application PASSED
-tests/test_api.py::test_frontend_graph PASSED
-tests/test_api.py::test_v1_score_endpoint PASSED
-tests/test_api.py::test_v1_cases_endpoint PASSED
-========================= 9 passed in 3.14s =========================
-```
-
-### 2. Manual Verification Workflow (Judge Walkthrough)
-1. **Health Verification:** Access `http://localhost:8000/health`. Confirm `{"status": "ok", "model_loaded": true, "intelligence": "live"}`.
-2. **Dashboard KPIs:** Navigate to `http://localhost:8000`. Observe live transaction counters, risk mix donut chart, alerts over time, and the top risk reasons bar chart.
-3. **Investigate a Case:** In the Alert Queue, click **Investigate** on `CASE-1001` (Account Takeover). Verify:
-   - Part 1: Timeline with evidence badges (`E1`, `E2`, `E3`).
-   - Part 2: Red/Green SHAP factor contribution bars and baseline comparison table.
-   - Part 3: Recommended action, interactive audit trail, and clickable AI Assistant chips.
-4. **Interact with AI Assistant:** In the case view sidebar, click *"Why was this flagged?"* or type a question. The response will cite structured evidence IDs.
-5. **Explore the Network Graph:** Navigate to `http://localhost:8000/graph.html`. Click **Highlight suspicious ring** to illuminate the multi-wallet mule pass-through cluster.
-6. **Customer Warning Demo:** Navigate to `http://localhost:8000/demo.html`. Select the *Scam victim* scenario, click **Send**, and toggle between **English** and **বাংলা** to see the pre-transaction customer intervention.
-
----
-
-## 11. Other Configuration
-
-### Frontend Mock vs. Live Backend Mode
-In [`Frontend/assets/js/api.js`](Frontend/assets/js/api.js), the communication mode is governed by:
-```javascript
-const USE_MOCK = false, BASE_URL = '/api';
-```
-- `USE_MOCK = false`: The frontend queries the live Python FastAPI backend and ML models.
-- `USE_MOCK = true`: Standalone offline mode using client-side mock datasets.
-
-### Continuous Retraining & Analyst Feedback Loop
-UpayShield supports analyst feedback ingestion. When an analyst marks alerts as false positives or confirms fraud, thresholds can be recalibrated using:
-```bash
-# Simulate 120 analyst decisions with threshold drift and apply to model:
-python -m ml.feedback --simulate 120 --drift --apply
-```
-
----
-
-## 12. Evaluation & Business Impact
-
-The models were evaluated on `data/transactions.csv` (79,711 synthetic transactions, 2,032 wallets, 30 days) using a strict **time-based split**: the first 70% of the timeline is used for training and validation (the last 20% of that slice picks the model and tunes the action thresholds), and the final 30% (23,914 transactions) is untouched until the final report. All numbers below come from `reports/metrics_v1.json`, written by `python -m ml.train`.
-
-### Model Benchmark Comparison (test set)
-
-| Model | ROC-AUC | PR-AUC | Precision @ 3% | Recall @ 3% |
-|---|---|---|---|---|
-| Logistic Regression (Baseline) | 0.9925 | 0.8368 | 56.62% | 88.07% |
-| Random Forest Classifier | 0.9988 | 0.9075 | 63.60% | 98.92% |
-| **LightGBM (Selected)** | **0.9986** | **0.9114** | **63.46%** | **98.70%** |
-| Isolation Forest (Unsupervised) | 0.9856 | 0.6408 | 49.79% | 77.44% |
-
-*LightGBM was selected by validation PR-AUC. Random Forest is statistically close; the choice between them is within run-to-run noise on this synthetic data. Single-row scoring (model + anomaly score, features already computed) takes about 15 ms on a laptop-class CPU, and about 23 ms with SHAP explanations. Feature computation is not included in that figure.*
-
-### Tuned Business Impact Metrics
-Using the cost matrix that balances fraud loss against customer friction (thresholds otp / hold / block = 0.01 / 0.02 / 0.03; the model is class-weighted, so its scores sit low and the cut-offs are low too):
-- **Fraud Value Prevented:** **91.8%** of attempted fraudulent funds.
-- **Legitimate Customer Friction:** **0.53%** of normal transactions got an OTP, hold or block.
-- **Recall by scenario (any action triggered):** Account Takeover 92.7%, Money-Mule Networks 100.0%, Structuring 100.0%, Scam Victims 68.8%. Rogue-agent bursts all fall in the training period of this dataset, so they have no test-set recall figure.
-
-**Caveat:** the data is synthetic (with 6% unreported-fraud label noise) and the same mule rings appear in both train and test, so absolute numbers are optimistic. Use them to compare models, not as real-world performance.
-
----
-
-## 13. Conclusion & Roadmap
-
-### Conclusion
-UpayShield bridges the critical gap between raw machine learning detection and operational compliance. By replacing black-box fraud scores with an auditable **three-part case narrative (What happened / Why risky / What next)**, network graph topology, and pre-transaction customer nudges in Bengali, UpayShield creates a safer, more transparent mobile money ecosystem for Bangladesh.
-
-### Roadmap
-- [x] **v1.0:** Time-split ML feature pipeline, LightGBM model, cost-tuned decision policy.
-- [x] **v1.1:** FastAPI central backend, NetworkX graph engine, agent peer profiling, and grounded AI assistant.
-- [x] **v1.2:** Unified static frontend hosting, Bengali/English warning demo, and automated test suite.
-- [ ] **v2.0 (Planned):** Semi-supervised graph neural networks (PyTorch Geometric) for deep mule ring discovery.
-- [ ] **v2.1 (Planned):** Biometric and behavioral device telemetry SDK integration for mobile clients.
-- [ ] **v2.2 (Planned):** Automated SAR (Suspicious Activity Report) PDF export formatted to Bangladesh Financial Intelligence Unit (BFIU) regulatory standards.
-
----
-
-## 14. Team & Contributions
-
-Developed with pride for the **Upay AI Dev Fest (Track 01: Trust & Risk Intelligence)**:
-
-| Name | Role | Responsibilities & Ownership | GitHub |
-|---|---|---|---|
-| **Ridwan Siddque** | **ML & Data Lead** | Synthetic dataset generation, 23 point-in-time features, LightGBM/Isolation Forest training, SHAP explainability, model evaluation, and feedback calibration. | [@Ridwan-Rythm](https://github.com/Ridwan-Rythm) |
-| **Sakib Hasan** | **Backend & Intelligence Lead** | FastAPI architecture, NetworkX graph intelligence, agent peer-group modeling, decision policy engine, grounded AI investigation assistant, and test suites. | [@sakib-hsn](https://github.com/sakib.hsn44) |
-| **Aritro Das** | **Frontend & Product Lead** | Analyst dashboard UI, interactive graph explorer, case investigation view, bilingual English/Bangla warning demo, and design system. | [@aritrodas](https://github.com/aritrodas) |
-
----
-*License: MIT. Developed for Upay AI Dev Fest 2026.*
+## Layout
+`ml/` features, rules, train, live scorer · `backend/app/` api, services (scoring, decision), intelligence (graph, agents, assistant, reports), store · `Frontend/` dashboard · `scripts/generate_data.py` · `tests/` · `docs/`. Config: `.env.example`. Optional LLM: `UPAY_LLM_PROVIDER=gemini|anthropic|openai` + `UPAY_LLM_API_KEY` (answers must cite evidence ids, else template fallback).
